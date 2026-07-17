@@ -28,6 +28,12 @@ option(
     ON
 )
 
+option(
+    MINGW_VULKAN_ENABLE_EXCEPTIONS
+    "Enable C++ exceptions"
+    OFF
+)
+
 set(
     SLANG_VERSION
     "2026.12.0.1"
@@ -95,7 +101,6 @@ cpmaddpackage(
     GITHUB_REPOSITORY gabime/spdlog
     GIT_TAG v1.17.0
     OPTIONS
-        "SPDLOG_BUILD_ALL OFF"
         "SPDLOG_BUILD_SHARED OFF"
         "SPDLOG_BUILD_EXAMPLE OFF"
         "SPDLOG_BUILD_EXAMPLE_HO OFF"
@@ -106,6 +111,7 @@ cpmaddpackage(
         "SPDLOG_FMT_EXTERNAL OFF"
         "SPDLOG_FMT_EXTERNAL_HO OFF"
         "SPDLOG_USE_STD_FORMAT ON"
+        "SPDLOG_NO_EXCEPTIONS ON"
 )
 
 cpmaddpackage(
@@ -304,9 +310,63 @@ add_library(slang::headers ALIAS slang_binary_headers)
 
 target_include_directories(
     slang_binary_headers
+    SYSTEM
     INTERFACE
         "${slang_include_dir}"
 )
+
+# ------------------------------------------------------------------------------
+# Mark third-party include directories as system includes
+# ------------------------------------------------------------------------------
+
+function(mark_target_includes_system target_name)
+    if(NOT TARGET "${target_name}")
+        return()
+    endif()
+
+    get_target_property(
+        aliased_target
+        "${target_name}"
+        ALIASED_TARGET
+    )
+
+    if(aliased_target)
+        set(real_target "${aliased_target}")
+    else()
+        set(real_target "${target_name}")
+    endif()
+
+    get_target_property(
+        target_include_dirs
+        "${real_target}"
+        INTERFACE_INCLUDE_DIRECTORIES
+    )
+
+    if(
+        NOT target_include_dirs
+        OR target_include_dirs MATCHES "-NOTFOUND$"
+    )
+        return()
+    endif()
+
+    set_property(
+        TARGET "${real_target}"
+        APPEND
+        PROPERTY
+            INTERFACE_SYSTEM_INCLUDE_DIRECTORIES
+            "${target_include_dirs}"
+    )
+endfunction()
+
+mark_target_includes_system(Vulkan::Headers)
+mark_target_includes_system(volk::volk)
+mark_target_includes_system(glfw)
+mark_target_includes_system(spdlog::spdlog)
+mark_target_includes_system(GPUOpen::VulkanMemoryAllocator)
+mark_target_includes_system(fastgltf::fastgltf)
+mark_target_includes_system(glm::glm)
+
+# slang_binary_headers already uses SYSTEM above.
 
 # ------------------------------------------------------------------------------
 # Application sources
@@ -385,7 +445,63 @@ else()
 endif()
 
 # ------------------------------------------------------------------------------
-# Compiler options
+# Exception and RTTI configuration
+# ------------------------------------------------------------------------------
+
+if(MINGW_VULKAN_ENABLE_EXCEPTIONS)
+    if(MSVC)
+        target_compile_options(
+            mingw-vulkan
+            PRIVATE
+                /EHsc
+                /GR-
+        )
+    elseif(
+        CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
+        OR CMAKE_CXX_COMPILER_ID MATCHES "Clang"
+    )
+        target_compile_options(
+            mingw-vulkan
+            PRIVATE
+                -fexceptions
+                -fno-rtti
+        )
+    endif()
+else()
+    target_compile_definitions(
+        mingw-vulkan
+        PRIVATE
+            SPDLOG_NO_EXCEPTIONS
+    )
+
+    if(MSVC)
+        target_compile_options(
+            mingw-vulkan
+            PRIVATE
+                /EHs-c-
+                /GR-
+        )
+
+        target_compile_definitions(
+            mingw-vulkan
+            PRIVATE
+                _HAS_EXCEPTIONS=0
+        )
+    elseif(
+        CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
+        OR CMAKE_CXX_COMPILER_ID MATCHES "Clang"
+    )
+        target_compile_options(
+            mingw-vulkan
+            PRIVATE
+                -fno-exceptions
+                -fno-rtti
+        )
+    endif()
+endif()
+
+# ------------------------------------------------------------------------------
+# Warning configuration
 # ------------------------------------------------------------------------------
 
 if(MSVC)
@@ -396,14 +512,6 @@ if(MSVC)
             /permissive-
             /Zc:preprocessor
             /Zc:__cplusplus
-            /EHsc
-            /GR-
-    )
-
-    target_compile_definitions(
-        mingw-vulkan
-        PRIVATE
-            _HAS_EXCEPTIONS=1
     )
 elseif(
     CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
@@ -420,16 +528,12 @@ elseif(
             -Wshadow
             -Wnon-virtual-dtor
             -Wold-style-cast
-            -fno-exceptions
-            -fno-rtti
-    )
-
-    target_compile_definitions(
-        mingw-vulkan
-        PRIVATE
-            _HAS_EXCEPTIONS=0
     )
 endif()
+
+# ------------------------------------------------------------------------------
+# MinGW runtime configuration
+# ------------------------------------------------------------------------------
 
 if(MINGW)
     target_link_options(
@@ -441,7 +545,7 @@ if(MINGW)
 endif()
 
 # ------------------------------------------------------------------------------
-# Third-party warning suppression
+# VMA implementation warning suppression
 # ------------------------------------------------------------------------------
 
 set(vma_source "${CMAKE_CURRENT_SOURCE_DIR}/src/vma.cxx")
@@ -579,6 +683,10 @@ set_target_properties(
 message(STATUS "Slang root: ${slang_root}")
 message(STATUS "Slang include directory: ${slang_include_dir}")
 message(STATUS "Slang binary directory: ${slang_bin_dir}")
+message(
+    STATUS
+    "C++ exceptions enabled: ${MINGW_VULKAN_ENABLE_EXCEPTIONS}"
+)
 
 if(SLANG_ROOT)
     message(STATUS "Slang source: extracted local installation")
