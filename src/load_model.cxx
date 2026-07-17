@@ -20,8 +20,8 @@ namespace {
 auto to_glm(fastgltf::math::fmat4x4 const &matrix) noexcept -> glm::mat4 {
   glm::mat4 result{1.0F};
 
-  for (std::size_t column = 0; column < 4; ++column) {
-    for (std::size_t row = 0; row < 4; ++row) {
+  for (glm::length_t column = 0; column < glm::length_t{4}; ++column) {
+    for (glm::length_t row = 0; row < glm::length_t{4}; ++row) {
       result[column][row] = matrix[column][row];
     }
   }
