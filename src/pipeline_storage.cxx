@@ -4,6 +4,8 @@
 
 #include "context.hxx"
 
+#include "logger.hxx"
+
 namespace {
 auto make_error(PipelineStorageErrorType type) noexcept
     -> PipelineStorageError {
@@ -29,6 +31,8 @@ PipelineStorage::PipelineStorage(PipelineStorage &&other) noexcept
       free_head_(std::exchange(other.free_head_, 0)),
       capacity_(std::exchange(other.capacity_, 0)),
       size_(std::exchange(other.size_, 0)),
+      global_descriptor_set_layout_(
+          std::exchange(other.global_descriptor_set_layout_, nullptr)),
       debug_name_(std::move(other.debug_name_)) {}
 
 auto PipelineStorage::operator=(PipelineStorage &&other) noexcept
@@ -48,6 +52,9 @@ auto PipelineStorage::operator=(PipelineStorage &&other) noexcept
   capacity_ = std::exchange(other.capacity_, 0);
 
   size_ = std::exchange(other.size_, 0);
+
+  global_descriptor_set_layout_ =
+      std::exchange(other.global_descriptor_set_layout_, nullptr);
 
   debug_name_ = std::move(other.debug_name_);
 
@@ -104,6 +111,9 @@ auto PipelineStorage::create_graphics(
     return std::unexpected(
         make_error(PipelineStorageErrorType::capacity_exceeded));
   }
+
+  info("Global descriptor set layout {}",
+       static_cast<void *>(global_descriptor_set_layout()));
 
   auto pipeline = Pipeline::create_graphics(*context_, create_info,
                                             global_descriptor_set_layout());

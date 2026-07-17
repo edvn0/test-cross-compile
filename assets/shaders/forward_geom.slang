@@ -95,11 +95,21 @@ OutputFS mainFs(VertexOutput input)
         0.82
     );
 
+    float debug_tint =
+    float(input.material_index & 1) * 0.05;
+
+
+
     float3 ambient = base_colour * 0.08;
     float3 diffuse = base_colour * ndotl;
 
-    OutputFS output;
-    output.colour = float4(ambient + diffuse, 1.0);
+    /* OutputFS output;
+output.colour = float4(
+    ambient + diffuse + debug_tint,
+    1.0
+); */
+OutputFS output;
+output.colour = float4(1.0, 0.0, 0.0, 1.0);
 
     return output;
 }

@@ -149,6 +149,7 @@ struct RendererCreateInfo {
   std::uint32_t pipeline_capacity = 128;
 
   VkFormat hdr_format = VK_FORMAT_R16G16B16A16_SFLOAT;
+  VkFormat swapchain_format = VK_FORMAT_B8G8R8A8_SRGB;
 
   VkFormat depth_format = VK_FORMAT_D32_SFLOAT;
 

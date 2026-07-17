@@ -154,6 +154,8 @@ auto Image::operator=(Image &&other) noexcept -> Image & {
 
   view_ = std::exchange(other.view_, VK_NULL_HANDLE);
 
+  descriptor_views_ = std::exchange(other.descriptor_views_, {});
+
   allocation_ = std::exchange(other.allocation_, VK_NULL_HANDLE);
 
   allocation_info_ = std::exchange(other.allocation_info_, VmaAllocationInfo{});

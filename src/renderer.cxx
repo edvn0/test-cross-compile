@@ -475,87 +475,184 @@ auto Renderer::initialize(RendererCreateInfo const &create_info)
   geometry_arena_ = std::move(*geometry_arena);
   material_storage_ = std::move(*material_storage);
 
-  auto compiled_vertex = compiler.compile(renderer::ShaderCompileRequest{
-      .source_path = "assets/shaders/forward_geom.slang",
-      .entry_point = "mainVs",
-      .stage = renderer::ShaderStage::vertex,
-      .include_directories = {},
-      .defines = {},
-  });
+  {
+    auto compiled_vertex = compiler.compile(renderer::ShaderCompileRequest{
+        .source_path = "assets/shaders/forward_geom.slang",
+        .entry_point = "mainVs",
+        .stage = renderer::ShaderStage::vertex,
+        .include_directories = {},
+        .defines = {},
+    });
 
-  if (!compiled_vertex) {
-    destroy();
+    if (!compiled_vertex) {
+      destroy();
 
-    return std::unexpected(make_compiler_error(compiled_vertex.error()));
+      return std::unexpected(make_compiler_error(compiled_vertex.error()));
+    }
+
+    auto compiled_fragment = compiler.compile(renderer::ShaderCompileRequest{
+        .source_path = "assets/shaders/forward_geom.slang",
+        .entry_point = "mainFs",
+        .stage = renderer::ShaderStage::fragment,
+        .include_directories = {},
+        .defines = {},
+    });
+
+    if (!compiled_fragment) {
+      destroy();
+
+      return std::unexpected(make_compiler_error(compiled_fragment.error()));
+    }
+
+    std::array<ShaderStageInfo, 2> const stages{
+        ShaderStageInfo{
+            .stage = VK_SHADER_STAGE_VERTEX_BIT,
+            .spirv = compiled_vertex->spirv,
+            .entry_point = "mainVs",
+            .flags = 0,
+            .specialization_info = nullptr,
+        },
+        ShaderStageInfo{
+            .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .spirv = compiled_fragment->spirv,
+            .entry_point = "mainFs",
+            .flags = 0,
+            .specialization_info = nullptr,
+        },
+    };
+
+    struct PC {
+      VkDeviceAddress a;
+      VkDeviceAddress b;
+      glm::mat4 vp;
+    };
+
+    auto const push_constant_range = VkPushConstantRange{
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        .offset = 0,
+        .size = sizeof(PC),
+    };
+
+    auto inserted_forward_pipeline =
+        pipeline_storage_.create_graphics(GraphicsPipelineCreateInfo{
+            .shaders = stages,
+            .additional_descriptor_set_layouts = {},
+            .push_constant_ranges = {&push_constant_range, 1},
+            .dynamic_states = {},
+            .colour_formats =
+                std::span{
+                    &create_info.hdr_format,
+                    1UZ,
+                },
+            .depth_format = create_info.depth_format,
+            .stencil_format = VK_FORMAT_UNDEFINED,
+            .samples = create_info.samples,
+            .debug_name = "renderer.forward_pipeline",
+        });
+
+    if (!inserted_forward_pipeline) {
+      destroy();
+      return std::unexpected(
+          make_pipeline_storage_error(inserted_forward_pipeline.error()));
+    }
+
+    forward_pipeline_ = *inserted_forward_pipeline;
   }
+  {
+    auto compiled_composite_vertex =
+        compiler.compile(renderer::ShaderCompileRequest{
+            .source_path = "assets/shaders/composite.slang",
+            .entry_point = "mainVs",
+            .stage = renderer::ShaderStage::vertex,
+            .include_directories = {},
+            .defines = {},
+        });
 
-  auto compiled_fragment = compiler.compile(renderer::ShaderCompileRequest{
-      .source_path = "assets/shaders/forward_geom.slang",
-      .entry_point = "mainFs",
-      .stage = renderer::ShaderStage::fragment,
-      .include_directories = {},
-      .defines = {},
-  });
+    if (!compiled_composite_vertex) {
+      destroy();
 
-  if (!compiled_fragment) {
-    destroy();
+      return std::unexpected(
+          make_compiler_error(compiled_composite_vertex.error()));
+    }
 
-    return std::unexpected(make_compiler_error(compiled_fragment.error()));
+    auto compiled_composite_fragment =
+        compiler.compile(renderer::ShaderCompileRequest{
+            .source_path = "assets/shaders/composite.slang",
+            .entry_point = "mainFs",
+            .stage = renderer::ShaderStage::fragment,
+            .include_directories = {},
+            .defines = {},
+        });
+
+    if (!compiled_composite_fragment) {
+      destroy();
+
+      return std::unexpected(
+          make_compiler_error(compiled_composite_fragment.error()));
+    }
+
+    std::array<ShaderStageInfo, 2> const composite_stages{
+        ShaderStageInfo{
+            .stage = VK_SHADER_STAGE_VERTEX_BIT,
+            .spirv = compiled_composite_vertex->spirv,
+            .entry_point = "mainVs",
+            .flags = 0,
+            .specialization_info = nullptr,
+        },
+        ShaderStageInfo{
+            .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .spirv = compiled_composite_fragment->spirv,
+            .entry_point = "mainFs",
+            .flags = 0,
+            .specialization_info = nullptr,
+        },
+    };
+
+    struct CompositePC {
+      std::uint32_t hdr_texture_index;
+      std::uint32_t sampler_index;
+      float exposure;
+      std::uint32_t padding;
+    };
+
+    static_assert(sizeof(CompositePC) == 16);
+
+    VkPushConstantRange const composite_push_constant_range{
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .offset = 0,
+        .size = sizeof(CompositePC),
+    };
+
+    auto inserted_composite_pipeline =
+        pipeline_storage_.create_graphics(GraphicsPipelineCreateInfo{
+            .shaders = composite_stages,
+            .additional_descriptor_set_layouts = {},
+            .push_constant_ranges =
+                {
+                    &composite_push_constant_range,
+                    1,
+                },
+            .dynamic_states = {},
+            .colour_formats =
+                std::span{
+                    &create_info.swapchain_format,
+                    1UZ,
+                },
+            .depth_format = VK_FORMAT_UNDEFINED,
+            .stencil_format = VK_FORMAT_UNDEFINED,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .debug_name = "renderer.composite_pipeline",
+        });
+
+    if (!inserted_composite_pipeline) {
+      destroy();
+
+      return std::unexpected(
+          make_pipeline_storage_error(inserted_composite_pipeline.error()));
+    }
+
+    composite_pipeline_ = *inserted_composite_pipeline;
   }
-
-  std::array<ShaderStageInfo, 2> const stages{
-      ShaderStageInfo{
-          .stage = VK_SHADER_STAGE_VERTEX_BIT,
-          .spirv = compiled_vertex->spirv,
-          .entry_point = "mainVs",
-          .flags = 0,
-          .specialization_info = nullptr,
-      },
-      ShaderStageInfo{
-          .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-          .spirv = compiled_fragment->spirv,
-          .entry_point = "mainFs",
-          .flags = 0,
-          .specialization_info = nullptr,
-      },
-  };
-
-  struct PC {
-    VkDeviceAddress a;
-    VkDeviceAddress b;
-    glm::mat4 vp;
-  };
-
-  auto const push_constant_range = VkPushConstantRange{
-      .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-      .offset = 0,
-      .size = sizeof(PC),
-  };
-
-  auto inserted_forward_pipeline =
-      pipeline_storage_.create_graphics(GraphicsPipelineCreateInfo{
-          .shaders = stages,
-          .additional_descriptor_set_layouts = {},
-          .push_constant_ranges = {&push_constant_range, 1},
-          .dynamic_states = {},
-          .colour_formats =
-              std::span{
-                  &create_info.hdr_format,
-                  1UZ,
-              },
-          .depth_format = create_info.depth_format,
-          .stencil_format = VK_FORMAT_UNDEFINED,
-          .samples = create_info.samples,
-          .debug_name = "renderer.forward_pipeline",
-      });
-
-  if (!inserted_forward_pipeline) {
-    destroy();
-    return std::unexpected(
-        make_pipeline_storage_error(inserted_forward_pipeline.error()));
-  }
-
-  forward_pipeline_ = *inserted_forward_pipeline;
 
   auto const white = image_storage_.white();
 
@@ -1350,6 +1447,12 @@ auto Renderer::record_frame(VkCommandBuffer command_buffer,
     return std::unexpected(make_error(RendererErrorType::invalid_pipeline));
   }
 
+  auto const *composite_pipeline = pipeline_storage_.get(composite_pipeline_);
+
+  if (composite_pipeline == nullptr) {
+    return std::unexpected(make_error(RendererErrorType::invalid_pipeline));
+  }
+
   auto const target_extent = frame.forward_target.extent();
 
   if (target_extent.width == 0 || target_extent.height == 0 ||
@@ -1499,17 +1602,8 @@ auto Renderer::record_frame(VkCommandBuffer command_buffer,
 
   vkCmdEndRendering(command_buffer);
 
-  /*
-   * The composite fragment shader will sample the HDR
-   * target, so make the forward colour writes visible
-   * and transition the image to shader-read layout.
-   */
   transition_hdr_to_shader_read(command_buffer, *hdr);
 
-  /*
-   * The composite pass overwrites the whole swapchain
-   * image, so its old contents may be discarded.
-   */
   transition_swapchain_to_attachment(command_buffer, swapchain_image.image);
 
   VkRenderingAttachmentInfo const swapchain_attachment{
@@ -1520,21 +1614,9 @@ auto Renderer::record_frame(VkCommandBuffer command_buffer,
       .resolveMode = VK_RESOLVE_MODE_NONE,
       .resolveImageView = VK_NULL_HANDLE,
       .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-      .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+      .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
       .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-      .clearValue =
-          VkClearValue{
-              .color =
-                  VkClearColorValue{
-                      .float32 =
-                          {
-                              0.0F,
-                              0.0F,
-                              0.0F,
-                              1.0F,
-                          },
-                  },
-          },
+      .clearValue = {},
   };
 
   VkRenderingInfo const composite_rendering_info{
@@ -1556,30 +1638,34 @@ auto Renderer::record_frame(VkCommandBuffer command_buffer,
 
   vkCmdBeginRendering(command_buffer, &composite_rendering_info);
 
+  vkCmdBindPipeline(command_buffer, composite_pipeline->bind_point(),
+                    composite_pipeline->pipeline());
+
+  gpu_resource_table_.bind(command_buffer, frame_index,
+                           VK_PIPELINE_BIND_POINT_GRAPHICS,
+                           composite_pipeline->layout());
+
   set_composite_dynamic_state(command_buffer, swapchain_image.extent);
 
-  /*
-   * Fullscreen composite draw goes here:
-   *
-   * vkCmdBindPipeline(
-   *     command_buffer,
-   *     VK_PIPELINE_BIND_POINT_GRAPHICS,
-   *     composite_pipeline_
-   * );
-   *
-   * Bind the descriptor containing hdr->view() in
-   * VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL.
-   *
-   * vkCmdBindDescriptorSets(...);
-   *
-   * vkCmdDraw(
-   *     command_buffer,
-   *     3,
-   *     1,
-   *     0,
-   *     0
-   * );
-   */
+  struct CompositePC {
+    std::uint32_t hdr_texture_index;
+    std::uint32_t sampler_index;
+    float exposure;
+    std::uint32_t padding;
+  };
+
+  CompositePC const composite_pc{
+      .hdr_texture_index = frame.forward_target.hdr().index,
+      .sampler_index = sampler_storage_.linear_clamp().index,
+      .exposure = 1.0F,
+      .padding = 0,
+  };
+
+  vkCmdPushConstants(command_buffer, composite_pipeline->layout(),
+                     VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(composite_pc),
+                     &composite_pc);
+
+  vkCmdDraw(command_buffer, 3, 1, 0, 0);
 
   vkCmdEndRendering(command_buffer);
 

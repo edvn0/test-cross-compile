@@ -606,6 +606,8 @@ auto create_device(VulkanContext &context) noexcept -> bool {
   vulkan12_features.pNext = &vulkan11_features;
   vulkan12_features.bufferDeviceAddress = VK_TRUE;
   vulkan12_features.scalarBlockLayout = VK_TRUE;
+  vulkan12_features.runtimeDescriptorArray = VK_TRUE;
+  vulkan12_features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
 
   VkPhysicalDeviceVulkan13Features vulkan13_features{};
   vulkan13_features.sType =
@@ -774,6 +776,7 @@ auto initialize_application(VulkanContext &context,
       .mesh_capacity = 4096,
       .model_capacity = 1024,
       .pipeline_capacity = 1024,
+      .swapchain_format = context.swapchain.format(),
       .maximum_draw_count = 65536,
       .maximum_submission_count = 65536,
   });

@@ -1,12 +1,13 @@
 #pragma once
 
-#include <vk_mem_alloc.h>
 #include <volk.h>
 
 #include <array>
 #include <cstdint>
 #include <expected>
 #include <string_view>
+
+#include <vk_mem_alloc.h>
 
 #include "forward.hxx"
 

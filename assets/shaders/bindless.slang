@@ -1,10 +1,15 @@
 module bindless;
 
-[[vk::binding(0, 0)]]
+
+public static const uint sampled_2d_binding = 0;
+public static const uint sampler_binding = 1;
+public static const uint comparison_sampler_binding = 2;
+
+public [[vk::binding(sampled_2d_binding, 0)]]
 Texture2D<float4> sampled_2d[];
 
-[[vk::binding(1, 0)]]
+public [[vk::binding(sampler_binding, 0)]]
 SamplerState samplers[];
 
-[[vk::binding(2, 0)]]
+public [[vk::binding(comparison_sampler_binding, 0)]]
 SamplerComparisonState comparison_samplers[];

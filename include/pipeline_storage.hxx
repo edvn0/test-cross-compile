@@ -114,13 +114,12 @@ private:
 
   VulkanContext *context_ = nullptr;
 
-  VkDescriptorSetLayout global_descriptor_set_layout_ = VK_NULL_HANDLE;
-
   std::vector<Slot> slots_;
 
   std::uint32_t free_head_ = 0;
   std::uint32_t capacity_ = 0;
   std::uint32_t size_ = 0;
 
+  VkDescriptorSetLayout global_descriptor_set_layout_ = VK_NULL_HANDLE;
   std::string debug_name_;
 };

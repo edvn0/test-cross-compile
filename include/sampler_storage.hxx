@@ -130,6 +130,14 @@ public:
     };
   }
 
+    [[nodiscard]]
+  auto linear_clamp() const noexcept -> SamplerHandle {
+    return {
+        .index = 0,
+        .generation = 1,
+    };
+  }
+
   [[nodiscard]]
   auto shadow_compare() const noexcept -> SamplerHandle {
     return {
