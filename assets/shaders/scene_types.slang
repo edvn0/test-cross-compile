@@ -121,6 +121,7 @@ public struct PC
     // instead of staking correctness on Slang's struct-array packing.
     public Ptr<GpuLight> lights;
     public uint light_count;
+    public uint _padding;
 };
 
 public struct ShadowPC
