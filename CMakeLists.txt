@@ -8,6 +8,12 @@ project(
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Global output directories -- set once here rather than per-target, so every
+# one of the 8 engine_<module> static libraries (and the executable) lands in
+# the same place without an explicit set_target_properties() call each.
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
 include(CTest)
 
 set(
@@ -1001,24 +1007,14 @@ add_custom_target(
 
 # ------------------------------------------------------------------------------
 # Project sources
+#
+# The 8 engine_<module> static libraries are configured by their own
+# src/<module>/CMakeLists.txt (explicit source lists, not file(GLOB) --
+# the point of the split is for each module's source list to document its
+# own contents). This section only resolves what's shared by all of them,
+# plus the sources that stay directly on the executable rather than any
+# module library.
 # ------------------------------------------------------------------------------
-
-file(
-    GLOB_RECURSE mingw_vulkan_core_sources
-    CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cxx"
-)
-
-list(
-    FILTER mingw_vulkan_core_sources
-    EXCLUDE REGEX "/platform/"
-)
-
-list(
-    FILTER mingw_vulkan_core_sources
-    EXCLUDE REGEX "/renderdoc/"
-)
 
 #
 # The global operator new/delete override (global_new_delete.cxx) routes every
@@ -1027,22 +1023,22 @@ list(
 # a Release build should carry -- Release gets no tracking overhead and, on
 # Linux, links jemalloc instead (see the "Release allocator" section below).
 #
+# A global new/delete override inside a static archive can be silently
+# dropped by the linker if nothing else in that archive member is
+# referenced, so this stays a source of the executable itself rather than
+# any engine_<module> library.
+#
 set(mingw_vulkan_track_memory ON)
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
   set(mingw_vulkan_track_memory OFF)
-
-  list(
-      FILTER mingw_vulkan_core_sources
-      EXCLUDE REGEX "/global_new_delete\\.cxx$"
-  )
 endif()
 
 #
 # main.cxx is just the entry point/frame loop/window-event wiring;
 # vulkan_bootstrap.cxx holds the one-time instance/device/swapchain bring-up
-# it calls into. Both belong to the executable rather than the reusable
-# core library, since nothing else links against them.
+# it calls into. Neither belongs to any engine_<module> library, since
+# nothing else links against them.
 #
 set(
     mingw_vulkan_main_sources
@@ -1060,18 +1056,19 @@ foreach(mingw_vulkan_main_source ${mingw_vulkan_main_sources})
   endif()
 endforeach()
 
-list(
-    REMOVE_ITEM
-    mingw_vulkan_core_sources
-    ${mingw_vulkan_main_sources}
-)
+if(mingw_vulkan_track_memory)
+  list(
+      APPEND mingw_vulkan_main_sources
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/global_new_delete.cxx"
+  )
+endif()
 
 #
 # Game sources -- linked only into the mingw-vulkan executable, never into
-# mingw-vulkan-core, so the core library stays entirely game-agnostic (see
-# include/game.hxx). game/include is added as a private include directory on
-# the executable target below, separate from mingw-vulkan-core's public
-# include/.
+# any engine_<module> library, so the module libraries stay entirely
+# game-agnostic (see include/app/game.hxx). game/include is added as a
+# private include directory on the executable target below, separate from
+# the module libraries' public include/.
 #
 file(
     GLOB_RECURSE mingw_vulkan_game_sources
@@ -1084,139 +1081,69 @@ list(
     ${mingw_vulkan_game_sources}
 )
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
-  file(
-      GLOB_RECURSE platform_sources
-      CONFIGURE_DEPENDS
-      "${CMAKE_CURRENT_SOURCE_DIR}/src/assets/platform/windows/*.cxx"
-  )
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  file(
-      GLOB_RECURSE platform_sources
-      CONFIGURE_DEPENDS
-      "${CMAKE_CURRENT_SOURCE_DIR}/src/assets/platform/linux/*.cxx"
-  )
-else()
-  set(platform_sources "")
-endif()
-
-list(
-    APPEND
-    mingw_vulkan_core_sources
-    ${platform_sources}
-)
-
-file(
-    GLOB_RECURSE mingw_vulkan_headers
-    CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/*.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/*.hxx"
-)
-
 # engine_deps needs stb_SOURCE_DIR, bullet3_SOURCE_DIR, shader_reflect_generated_dir
 # and slang_root, all resolved above -- must be included after them.
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/engine_deps.cmake")
 
+# configure_renderdoc(), called from src/gpu/CMakeLists.txt below, must be
+# defined before that add_subdirectory() runs.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/renderdoc_config.cmake")
+
+# ------------------------------------------------------------------------------
+# Module libraries
+#
+# Added in dependency order (core < gpu < assets < physics < scene < terrain
+# < rendering < app) for readability; CMake itself doesn't require this
+# order since target_link_libraries() may reference a not-yet-defined
+# target as long as it exists by generate time.
+# ------------------------------------------------------------------------------
+
+add_subdirectory(src/core)
+add_subdirectory(src/gpu)
+add_subdirectory(src/assets)
+add_subdirectory(src/physics)
+add_subdirectory(src/scene)
+add_subdirectory(src/terrain)
+add_subdirectory(src/rendering)
+add_subdirectory(src/app)
+
 # ------------------------------------------------------------------------------
 # Core library
+#
+# mingw-vulkan-core is now a thin INTERFACE umbrella over the 8
+# engine_<module> libraries, so downstream consumers (the executable,
+# test/CMakeLists.txt) don't need to know the module list -- this alias
+# already existed pre-split, this just repoints what it aliases.
+#
+# $<LINK_GROUP:RESCAN,...> wraps the 8 libraries the way -Wl,--start-group /
+# --end-group would: a plain left-to-right static-archive link only ever
+# rescans an *earlier* archive for a symbol a *later* one turns out to need,
+# never the reverse, so a strictly-layered link order breaks the two
+# deliberate exceptions to that layering that were fine as a single archive
+# but aren't once it's 8 separate ones -- error_describe.cxx (core) defining
+# the generic describe() dispatcher that calls per-subsystem overloads
+# defined in gpu/assets/rendering (Phase 2 point 9), and renderer.cxx
+# (rendering) instantiating Renderer::record_frame<ApplicationOverlayPolicy>,
+# which calls back into renderer_application_policy.cxx (app) (Phase 3's
+# "one deliberate header/impl module split"). RESCAN makes the linker keep
+# revisiting the whole group until every symbol resolves, in any direction.
 # ------------------------------------------------------------------------------
 
 add_library(
     mingw-vulkan-core
-    STATIC
-        ${mingw_vulkan_core_sources}
-        ${mingw_vulkan_headers}
+    INTERFACE
+)
+
+target_link_libraries(
+    mingw-vulkan-core
+    INTERFACE
+        "$<LINK_GROUP:RESCAN,engine_app,engine_rendering,engine_terrain,engine_scene,engine_physics,engine_assets,engine_gpu,engine_core>"
 )
 
 add_library(
     mingw-vulkan::core
     ALIAS
     mingw-vulkan-core
-)
-
-add_dependencies(
-    mingw-vulkan-core
-    generate_shader_push_constants
-)
-
-target_link_libraries(
-    mingw-vulkan-core
-    PUBLIC
-        engine_deps
-    PRIVATE
-        engine_options
-)
-
-target_precompile_headers(
-    mingw-vulkan-core
-    PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/core/pch.hxx"
-)
-
-if(mingw_vulkan_track_memory)
-  target_compile_definitions(
-      mingw-vulkan-core
-      PRIVATE
-          MINGW_VULKAN_TRACK_MEMORY=1
-  )
-else()
-  target_compile_definitions(
-      mingw-vulkan-core
-      PRIVATE
-          MINGW_VULKAN_TRACK_MEMORY=0
-  )
-endif()
-
-# ------------------------------------------------------------------------------
-# Release allocator (Linux only)
-#
-# windows-mingw Release just gets the plain system allocator -- jemalloc's
-# Windows/mingw-w64 support isn't solid enough to depend on for a
-# cross-compiled target. linux-native Release links jemalloc, which overrides
-# malloc/free (and therefore the default operator new/delete, which call
-# through to malloc) via ordinary symbol interposition -- no source changes
-# needed on our side. Requires libjemalloc-dev in the build image; see
-# Dockerfile.
-# ------------------------------------------------------------------------------
-
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_BUILD_TYPE STREQUAL "Release")
-  find_library(MINGW_VULKAN_JEMALLOC_LIBRARY jemalloc)
-
-  if(MINGW_VULKAN_JEMALLOC_LIBRARY)
-    target_link_libraries(
-        mingw-vulkan-core
-        PUBLIC
-            "${MINGW_VULKAN_JEMALLOC_LIBRARY}"
-    )
-  else()
-    message(
-        WARNING
-        "libjemalloc not found -- linux-native Release will use the plain "
-        "system allocator. Install libjemalloc-dev to enable it."
-    )
-  endif()
-endif()
-
-# ------------------------------------------------------------------------------
-# RenderDoc
-#
-# RenderDoc implementation belongs to the core library, since the executable
-# itself only contains main.cxx and vulkan_bootstrap.cxx (the entry point,
-# frame loop, and one-time Vulkan bring-up).
-# ------------------------------------------------------------------------------
-
-include(
-    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/renderdoc_config.cmake"
-)
-
-configure_renderdoc(
-    mingw-vulkan-core
-    REAL_SOURCE
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/renderdoc/renderdoc.cxx"
-    STUB_SOURCE
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/renderdoc/stub.cxx"
-    INCLUDE_CACHE_VARIABLE
-        RENDERDOC_INCLUDE_PATH
 )
 
 # ------------------------------------------------------------------------------
@@ -1288,29 +1215,35 @@ else()
 endif()
 
 # ------------------------------------------------------------------------------
-# VMA warning suppression
+# Release allocator (Linux only)
+#
+# windows-mingw Release just gets the plain system allocator -- jemalloc's
+# Windows/mingw-w64 support isn't solid enough to depend on for a
+# cross-compiled target. linux-native Release links jemalloc, which overrides
+# malloc/free (and therefore the default operator new/delete, which call
+# through to malloc) via ordinary symbol interposition -- no source changes
+# needed on our side. Requires libjemalloc-dev in the build image; see
+# Dockerfile.
+#
+# Attached to the executable rather than any engine_<module> library: like
+# global_new_delete.cxx, its effect depends on final link-line position, not
+# on which archive happens to reference it.
 # ------------------------------------------------------------------------------
 
-set(
-    vma_source
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/vma.cxx"
-)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_BUILD_TYPE STREQUAL "Release")
+  find_library(MINGW_VULKAN_JEMALLOC_LIBRARY jemalloc)
 
-if(EXISTS "${vma_source}")
-  if(MSVC)
-    set_source_files_properties(
-        "${vma_source}"
-        PROPERTIES
-            COMPILE_OPTIONS "/W0"
+  if(MINGW_VULKAN_JEMALLOC_LIBRARY)
+    target_link_libraries(
+        mingw-vulkan
+        PRIVATE
+            "${MINGW_VULKAN_JEMALLOC_LIBRARY}"
     )
-  elseif(
-      CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
-      OR CMAKE_CXX_COMPILER_ID MATCHES "Clang"
-  )
-    set_source_files_properties(
-        "${vma_source}"
-        PROPERTIES
-            COMPILE_OPTIONS "-w"
+  else()
+    message(
+        WARNING
+        "libjemalloc not found -- linux-native Release will use the plain "
+        "system allocator. Install libjemalloc-dev to enable it."
     )
   endif()
 endif()
@@ -1337,22 +1270,6 @@ foreach(asset_directory IN LISTS project_asset_directories)
     )
   endif()
 endforeach()
-
-# ------------------------------------------------------------------------------
-# Output directories
-# ------------------------------------------------------------------------------
-
-set_target_properties(
-    mingw-vulkan
-    PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
-)
-
-set_target_properties(
-    mingw-vulkan-core
-    PROPERTIES
-        ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
-)
 
 # ------------------------------------------------------------------------------
 # Tests

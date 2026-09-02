@@ -25,7 +25,7 @@ namespace {
         return x < static_cast<float>(truncated) ? truncated - 1 : truncated;
     }
 
-    auto corner_contribution(float x, float y, std::uint8_t gradient_index) -> float {
+    auto corner_contribution(float x, float y, std::unsigned_integral auto gradient_index) -> float {
         auto t = 0.5F - x * x - y * y;
         if (t < 0.0F) {
             return 0.0F;
@@ -88,8 +88,7 @@ auto SimplexNoise2D::sample(float x, float y) const -> float {
     return 70.0F * (n0 + n1 + n2);
 }
 
-auto SimplexNoise2D::fbm(float x, float y, std::uint32_t octaves, float lacunarity, float persistence) const
-        -> float {
+auto SimplexNoise2D::fbm(float x, float y, std::uint32_t octaves, float lacunarity, float persistence) const -> float {
     float amplitude = 1.0F;
     float frequency = 1.0F;
     float sum = 0.0F;

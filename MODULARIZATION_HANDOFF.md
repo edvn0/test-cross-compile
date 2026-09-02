@@ -5,19 +5,105 @@ plan, on this machine only). This file is the **execution status** and the
 **remaining work**, self-contained so it survives moving machines. Delete this
 file once the split is finished and merged.
 
-## Status: Phase 1 & 2 done and verified. Phase 3 & 4 not started.
+## Status: Phase 1, 2, 3 & 4 all done and verified. Nothing left but the
+## runtime smoke-test and merging.
 
-Current working-tree state (uncommitted): `git status --short` shows ~30
-modified + ~15 new files, all under `include/`, `src/`, `cmake/`,
-`test/CMakeLists.txt`, `CMakeLists.txt`. **Nothing has been committed.**
-Everything still lives in flat `include/*.hxx` / `src/*.cxx` — no files have
-been physically moved into module directories yet. The single
-`mingw-vulkan-core` static library still exists; it has not been split.
+Phases 1-3 are committed (`feat: Modularise`, `feat: Some moves`). Phase 4
+(the 8-library split) is implemented but **not yet committed** as of this
+writing — `git status --short` will show the new `src/<module>/CMakeLists.txt`
+files plus edits to the root `CMakeLists.txt` and `cmake/renderdoc_config.cmake`.
+Every file now lives under its `include/<module>/` / `src/<module>/`
+directory, and `mingw-vulkan-core` is a thin `INTERFACE` target aggregating
+8 real `engine_<module>` static libraries (`engine_core`, `engine_gpu`,
+`engine_assets`, `engine_physics`, `engine_scene`, `engine_terrain`,
+`engine_rendering`, `engine_app`).
 
-Verified green on `TARGET=linux-native CMAKE_BUILD_TYPE=Debug`:
-`./compile.sh --build` builds clean, `./compile.sh --test` passes all 123
-tests. **windows-mingw has deliberately not been built this session** (user
-asked to skip it) — build it before trusting this branch cross-compiles.
+Verified green:
+- `TARGET=linux-native CMAKE_BUILD_TYPE=Debug   ./compile.sh --rebuild` — clean parallel build, 681 targets.
+- `TARGET=linux-native CMAKE_BUILD_TYPE=Release ./compile.sh --build`   — clean build, 680 targets (no `mingw-vulkan-tests` filter difference; `global_new_delete.cxx` correctly excluded).
+- `TARGET=linux-native` `--test` passes all 123 tests, both Debug and Release.
+- `TARGET=windows-mingw CMAKE_BUILD_TYPE=Debug  ./compile.sh --rebuild` — clean cross-compiled build, 648 targets, links `bin/mingw-vulkan.exe`. (Not built earlier in the previous session; built and verified in this one.)
+- Back-edge verification script (Phase 2's version, `#include`-based) still
+  reports the single expected edge and nothing else — Phase 4 didn't touch
+  any `#include`.
+
+**Runtime smoke-tested this session** (the previous session's environment
+had no display; this one does — a real NVIDIA GPU behind an X11 display at
+`:1`). Ran `build/linux-native-debug/bin/mingw-vulkan` directly for 15s
+uninterrupted: selects the real physical device, creates the logical device
+and swapchain, initializes the renderer and registers all 13 pipelines,
+loads `test_cube.glb`, streams its textures through the async
+`texture_streamer` (including a genuine, pre-existing, unrelated content bug
+— `dirt_rough_1k.exr` fails to decode with "unsupported feature" and
+correctly falls back to its fallback texture instead of crashing), renders
+ImGui, and survives a swapchain recreation. No crash, no Vulkan validation
+error, no assertion/segfault/terminate in the log. This exercises the
+`IMeshSink`/`IModelSink` paths from Phase 2 end-to-end.
+**Not exercised by this particular scene**: terrain streaming (this sample
+scene has no terrain), physics debug-draw toggle, shader hot-reload, and the
+in-app Memory panel — the sample app here just doesn't happen to touch those
+paths. Worth a manual look before merging if the real content set exercises
+them.
+
+### A real problem Phase 2's back-edge analysis couldn't catch: link-time circularity
+
+Splitting into 8 real static libraries surfaced something the `#include`-graph
+verification script is structurally blind to: **two deliberate cross-module
+*symbol* dependencies that only become a problem once each module is its own
+archive.**
+
+1. `error_describe.cxx` (**core**) defines the generic `describe(variant<...>)`
+   dispatcher (Phase 2 point 9), which calls per-subsystem `describe()`
+   overloads defined in **gpu** (`gpu_error_describe.cxx`), **assets**
+   (`assets_error_describe.cxx`), and **rendering**
+   (`rendering_error_describe.cxx`) — i.e. core calls upward into every
+   higher layer, by design, for exactly one function.
+2. `renderer.cxx` (**rendering**) instantiates
+   `Renderer::record_frame<ApplicationOverlayPolicy>`, which calls
+   `ApplicationOverlayPolicy::render_debug`/`render_ui`, defined in
+   `renderer_application_policy.cxx` — which Phase 3 deliberately placed in
+   **app**, not rendering, precisely because it needs the complete
+   `Application` type (see "one deliberate header/impl module split" above).
+   So rendering calls upward into app, also by design.
+
+Neither of these is visible to a `#include`-based cycle check — there's no
+header cycle, only a link-time symbol dependency. With everything in one
+archive (pre-split), the linker's normal multi-pass-within-one-archive
+symbol resolution papered over it invisibly. Split into 8 archives linked in
+strict layering order, GNU ld's single left-to-right pass genuinely can't
+resolve it: by the time it reaches `libengine_core.a` needing a symbol from
+`libengine_gpu.a`, it has already moved past that archive and won't revisit
+it.
+
+**Fix:** wrap the whole `mingw-vulkan-core` INTERFACE target's link list in
+`$<LINK_GROUP:RESCAN,...>` (CMake ≥3.24 — this repo requires ≥3.25, so it's
+free to use), CMake's portable equivalent of `-Wl,--start-group` /
+`--end-group`. This makes the linker keep revisiting the whole group of 8
+until every symbol resolves, regardless of direction. Confirmed working on
+both GNU ld (linux-native) and mingw-w64's ld (windows-mingw cross-compile).
+If you ever see "undefined reference" errors that look like they *should*
+resolve — the defining `.o` is right there in the link line — check whether
+it's this exact shape (a symbol only reachable via a later-linked archive
+needing an earlier one) before assuming something is actually missing.
+
+### Other Phase 3 corrections found only once Phase 4 forced a real rebuild
+
+Phase 3's own text claimed "the existing single `mingw-vulkan-core`
+`CMakeLists.txt` should still work unmodified" because the `file(GLOB_RECURSE
+...)` calls are already recursive. That's true for the *glob* calls, but
+**five explicit path references elsewhere in the root `CMakeLists.txt` still
+pointed at the old flat locations** and needed updating during the Phase 3
+checkpoint, before Phase 4 even started:
+- The two `platform_sources` globs (`src/platform/{linux,windows}/*.cxx` →
+  `src/assets/platform/{linux,windows}/*.cxx`).
+- The two `configure_renderdoc()` source paths
+  (`src/renderdoc/{renderdoc,stub}.cxx` → `src/gpu/renderdoc/{renderdoc,stub}.cxx`).
+- The two `target_precompile_headers(... include/pch.hxx)` calls
+  (→ `include/core/pch.hxx`).
+If you're redoing this split elsewhere, don't trust "the globs are recursive
+so nothing else needs to change" — grep the whole root `CMakeLists.txt` for
+every literal `src/` or `include/` path, not just the `file(GLOB_RECURSE)`
+calls, before considering a Phase 3 checkpoint build actually green.
 
 ### Phase 1 (done): `engine_options` / `engine_deps`
 
@@ -411,7 +497,7 @@ mapping above.
    this doesn't pass, the include rewrite has a bug; find it before moving on
    to Phase 4 rather than debugging two changes at once.
 
-## Phase 4 (not started): split into 8 static libraries
+## Phase 4 (done, verified — see status header above): split into 8 static libraries
 
 Only attempt this after Phase 3's checkpoint build is green.
 
@@ -503,30 +589,36 @@ Only attempt this after Phase 3's checkpoint build is green.
 ## Verification checklist for the finished split
 
 ```
-TARGET=linux-native  ./compile.sh --rebuild   # clean, parallel — catches missing add_dependencies
-TARGET=windows-mingw ./compile.sh --rebuild   # not yet run this session at all — do this before trusting the branch
-TARGET=linux-native  ./compile.sh --test      # 123 tests currently; must still be 123 passing
+TARGET=linux-native  ./compile.sh --rebuild   # done: clean, parallel, 681 targets, green
+TARGET=windows-mingw ./compile.sh --rebuild   # done: clean, parallel, 648 targets, green (cross-compiled)
+TARGET=linux-native  ./compile.sh --test      # done: 123/123 passing, both Debug and Release
 ```
 
 Then:
-- Re-run the "Verification script" above with a `groups` dict rewritten
-  for the post-move directory names (or just grep `#include "rendering/`
-  etc. from `src/terrain`, `src/assets`, `src/gpu`, `src/core` — should be
-  empty).
-- Confirm `HAS_RENDERDOC` is visible (not silently `0`-via-undefined) in both
-  `application.cxx` and `vulkan_bootstrap.cxx` after the `PUBLIC` fix above —
-  e.g. temporarily `#error HAS_RENDERDOC` in each to see the define's actual
-  value at that TU, or just check `compile_commands.json` for
-  `-DHAS_RENDERDOC=` on those two files.
-- Run the app (there's a `run` skill/agent pattern used elsewhere in this
-  session's tooling — use whatever this repo's normal "run and look at it"
-  process is) and confirm: terrain streams, models load async, physics
-  debug-draw toggle still works, shader hot-reload still works. These are
-  exactly the paths that went through `IMeshSink`/`IModelSink`/`IDebugLines`/
-  `ShaderChangeQueue` in Phase 2 — the interfaces compiling is not the same
-  as them being wired correctly at runtime, and none of this was
-  runtime-tested this session (compile + unit tests only).
-- Confirm Release-mode Linux still links jemalloc and Debug-mode memory
-  tracking (`global_new_delete.cxx` move) still works — build both
-  `CMAKE_BUILD_TYPE=Debug` and `CMAKE_BUILD_TYPE=Release` for
-  `TARGET=linux-native` at least once each.
+- ✅ Re-ran the "Verification script" above (unchanged — Phase 4 didn't touch
+  any `#include`): still exactly the one expected back-edge.
+- ✅ Confirmed `HAS_RENDERDOC` is visible (not silently `0`-via-undefined) in
+  both `application.cxx` and `vulkan_bootstrap.cxx` after the `PUBLIC` fix —
+  checked `compile_commands.json` for `-DHAS_RENDERDOC=` on both TUs; both
+  show `HAS_RENDERDOC=0` (RenderDoc disabled in this environment, as
+  expected — the point was confirming the define reaches them at all, which
+  it now does).
+- ✅ Confirmed Release-mode Linux attempts to link jemalloc (falls back to a
+  warning + system allocator in this environment, since libjemalloc-dev
+  isn't installed here — that's a pre-existing environment gap, not a
+  regression; the `find_library` / `target_link_libraries` logic itself is
+  unchanged in intent, just retargeted from `mingw-vulkan-core` to
+  `mingw-vulkan`) and that Debug-mode `global_new_delete.cxx` is compiled
+  into the executable while Release excludes it (checked via
+  `compile_commands.json` / build output, not just visual inspection) — both
+  `CMAKE_BUILD_TYPE=Debug` and `CMAKE_BUILD_TYPE=Release` built and tested
+  for `TARGET=linux-native`.
+- ✅ Ran the app directly (`build/linux-native-debug/bin/mingw-vulkan`, 15s,
+  real NVIDIA GPU): device/swapchain/renderer init succeed, model + textures
+  load and stream async, ImGui renders, swapchain recreation survives, no
+  Vulkan validation errors or crashes. See the status header above for
+  details. Terrain streaming, physics debug-draw, and shader hot-reload
+  weren't exercised by this particular sample scene — worth a manual look
+  with real content before merging, but the async-loading interfaces from
+  Phase 2 (`IMeshSink`/`IModelSink`) are now confirmed wired correctly at
+  runtime, not just at compile time.
