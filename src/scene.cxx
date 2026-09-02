@@ -1,7 +1,10 @@
 #include "scene.hxx"
 
 #include "components.hxx"
+#include "debug_renderer.hxx"
 #include "physics_world.hxx"
+#include "renderer.hxx"
+#include "thread_pool.hxx"
 
 Scene::Scene(Renderer &renderer) {
     connect_light_signals();
@@ -11,7 +14,7 @@ Scene::Scene(Renderer &renderer) {
 Scene::~Scene() = default;
 
 auto Scene::on_scene_start() -> void {
-    physics_world = std::make_unique<PhysicsWorld>(physics_settings, Renderer::thread_pool(), registry);
+    physics_world = std::make_unique<PhysicsWorld>(physics_settings, thread_pool(), registry);
     physics_world->populate_from(registry);
 }
 

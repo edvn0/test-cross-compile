@@ -10,14 +10,13 @@
 #include <vector>
 
 #include "material.hxx"
+#include "mesh_sink.hxx"
 #include "physics_world.hxx"
 #include "terrain_chunk.hxx"
 #include "terrain_mesh.hxx"
 #include "terrain_quadtree.hxx"
 #include "terrain_slot_pool.hxx"
 #include "terrain_streamer.hxx"
-
-struct Renderer;
 
 struct TerrainWorldCreateInfo {
     // amplitude/frequency/octaves/... plus a real height_range_min/max
@@ -52,14 +51,14 @@ struct TerrainWorldCreateInfo {
 // (TerrainStreamer), and the fixed GPU slot pool (TerrainSlotPool) chunks
 // are written into. Deliberately touches no entt::registry and creates no
 // entities -- terrain chunks are submitted directly via
-// Renderer::submit_mesh (see submit()) and collide via PhysicsWorld's
+// IMeshSink::submit_mesh (see submit()) and collide via PhysicsWorld's
 // registry-less terrain collider pool (see physics_world.hxx) -- so there
 // is nothing here for Scene/Application::clone_registry to know about.
 class TerrainWorld {
 public:
     TerrainWorld() = default;
 
-    [[nodiscard]] static auto create(Renderer &renderer, VkCommandBuffer command_buffer,
+    [[nodiscard]] static auto create(IMeshSink &mesh_sink, VkCommandBuffer command_buffer,
                                      TerrainWorldCreateInfo const &create_info)
             -> std::expected<TerrainWorld, TerrainSlotPoolError>;
 
@@ -78,12 +77,12 @@ public:
     // load-bearing (the write-before-read barrier direction), not
     // incidental. `physics` may be null (editor, or mid scene-stop) --
     // terrain then streams visually with no collision.
-    auto process_ready(Renderer &renderer, VkCommandBuffer command_buffer, PhysicsWorld *physics) -> void;
+    auto process_ready(IMeshSink &mesh_sink, VkCommandBuffer command_buffer, PhysicsWorld *physics) -> void;
 
     // Submits every currently-resident chunk for drawing. Call once per
     // frame from wherever submit_model/submit_mesh calls happen for the
     // rest of the scene (see src/main.cxx's submit_scene).
-    auto submit(Renderer &renderer) const -> void;
+    auto submit(IMeshSink &mesh_sink) const -> void;
 
     // PhysicsWorld is recreated wholesale on Scene::on_scene_start/stop
     // (see scene.cxx) -- every previously-bound TerrainColliderHandle
@@ -110,7 +109,7 @@ private:
     [[nodiscard]] auto chunk_request_for(ChunkKey const &key) const -> TerrainChunkRequest;
 
     auto request_missing() -> void;
-    auto upload_ready(Renderer &renderer, VkCommandBuffer command_buffer) -> void;
+    auto upload_ready(IMeshSink &mesh_sink, VkCommandBuffer command_buffer) -> void;
     auto update_colliders(PhysicsWorld *physics) -> void;
     auto evict(PhysicsWorld *physics) -> void;
 

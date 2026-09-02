@@ -13,10 +13,10 @@
 #include "error_context.hxx"
 
 #include "buffer.hxx"
+#include "compressed_texture.hxx"
 #include "forward.hxx"
 #include "image.hxx"
 #include "object_pool.hxx"
-#include "texture_pipeline.hxx"
 
 enum class ImageDescriptorClass : std::uint8_t {
     sampled_2d,

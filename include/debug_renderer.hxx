@@ -6,12 +6,13 @@
 
 #include <glm/fwd.hpp>
 
+#include "debug_lines.hxx"
+
 class Renderer;
-class btIDebugDraw;
 
 namespace debug_draw {
 
-    class DebugRenderer final {
+    class DebugRenderer final : public IDebugLines {
     public:
         explicit DebugRenderer(Renderer &renderer);
         ~DebugRenderer();
@@ -22,13 +23,13 @@ namespace debug_draw {
         DebugRenderer(DebugRenderer &&) noexcept;
         auto operator=(DebugRenderer &&) noexcept -> DebugRenderer &;
 
-        auto begin_frame() -> void;
+        auto begin_frame() -> void override;
 
         auto render(VkCommandBuffer cmd, glm::mat4 const &view_projection, std::uint32_t frame_index) -> void;
 
         auto render(VkCommandBuffer cmd, std::span<const float, 16> view_projection, std::uint32_t frame_index) -> void;
 
-        auto clear_lines() -> void;
+        auto clear_lines() -> void override;
 
         // Physics collider wireframes drawn via PhysicsWorld's Bullet debug
         // drawer -- disabled by default, opt in via Application::on_ui().
@@ -37,7 +38,7 @@ namespace debug_draw {
         auto physics_debug_enabled() const noexcept -> bool;
 
         [[nodiscard]]
-        auto bullet_debug_draw() noexcept -> btIDebugDraw *;
+        auto bullet_debug_draw() noexcept -> btIDebugDraw * override;
 
     private:
         struct Impl;

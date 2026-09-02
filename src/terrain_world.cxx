@@ -2,11 +2,10 @@
 
 #include "error_describe.hxx"
 #include "logger.hxx"
-#include "renderer.hxx"
 
 #include <algorithm>
 
-auto TerrainWorld::create(Renderer &renderer, VkCommandBuffer command_buffer,
+auto TerrainWorld::create(IMeshSink &mesh_sink, VkCommandBuffer command_buffer,
                           TerrainWorldCreateInfo const &create_info)
         -> std::expected<TerrainWorld, TerrainSlotPoolError> {
 
@@ -29,7 +28,7 @@ auto TerrainWorld::create(Renderer &renderer, VkCommandBuffer command_buffer,
             .height_range_max = create_info.params.height_range_max,
     };
 
-    auto pool = TerrainSlotPool::create(renderer, command_buffer, pool_info);
+    auto pool = TerrainSlotPool::create(mesh_sink, command_buffer, pool_info);
 
     if (!pool) {
         return std::unexpected(pool.error());
@@ -89,14 +88,14 @@ auto TerrainWorld::request_missing() -> void {
     }
 }
 
-auto TerrainWorld::process_ready(Renderer &renderer, VkCommandBuffer command_buffer, PhysicsWorld *physics) -> void {
+auto TerrainWorld::process_ready(IMeshSink &mesh_sink, VkCommandBuffer command_buffer, PhysicsWorld *physics) -> void {
     slot_pool_.tick_retirement();
-    upload_ready(renderer, command_buffer);
+    upload_ready(mesh_sink, command_buffer);
     update_colliders(physics);
     evict(physics);
 }
 
-auto TerrainWorld::upload_ready(Renderer &renderer, VkCommandBuffer command_buffer) -> void {
+auto TerrainWorld::upload_ready(IMeshSink &mesh_sink, VkCommandBuffer command_buffer) -> void {
     std::uint32_t uploaded_this_frame = 0;
     auto const mid_height = (create_info_.params.height_range_min + create_info_.params.height_range_max) * 0.5F;
 
@@ -119,7 +118,7 @@ auto TerrainWorld::upload_ready(Renderer &renderer, VkCommandBuffer command_buff
             return;
         }
 
-        if (!slot_pool_.write(renderer, command_buffer, *slot, result.vertices)) {
+        if (!slot_pool_.write(mesh_sink, command_buffer, *slot, result.vertices)) {
             error("terrain_world: failed to upload chunk ({},{}) lod={}", key.x, key.z, key.lod);
             slot_pool_.release_deferred(*slot);
             return;
@@ -205,12 +204,12 @@ auto TerrainWorld::evict(PhysicsWorld *physics) -> void {
     }
 }
 
-auto TerrainWorld::submit(Renderer &renderer) const -> void {
+auto TerrainWorld::submit(IMeshSink &mesh_sink) const -> void {
     for (auto const &[key, chunk]: resident_) {
         glm::mat4 transform{1.0F};
         transform[3] = glm::vec4{chunk.centre, 1.0F};
 
-        auto submitted = renderer.submit_mesh(slot_pool_.mesh(chunk.slot), transform, create_info_.material);
+        auto submitted = mesh_sink.submit_mesh(slot_pool_.mesh(chunk.slot), transform, create_info_.material);
 
         if (!submitted) {
             error("terrain_world: submit_mesh failed for chunk ({},{}) lod={}: {}", key.x, key.z, key.lod,

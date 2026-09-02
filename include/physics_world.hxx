@@ -6,9 +6,11 @@
 
 #include <BS_thread_pool.hpp>
 
-#include "components.hxx"
+#include "debug_lines.hxx"
 #include "forward.hxx"
 #include "physics.hxx"
+#include "physics_components.hxx"
+#include "transform.hxx"
 
 #include <cstdint>
 #include <limits>
@@ -103,7 +105,7 @@ public:
     // bind_terrain_collider'd again later. No-op if not currently bound.
     auto unbind_terrain_collider(TerrainColliderHandle handle) -> void;
 
-    auto attach_debug_drawer(debug_draw::DebugRenderer &renderer) -> void;
+    auto attach_debug_drawer(IDebugLines &debug_lines) -> void;
     auto detach_debug_drawer() -> void;
 
     auto set_velocity(entt::registry const &registry, entt::entity entity, glm::vec3 const &linear_velocity) -> void;

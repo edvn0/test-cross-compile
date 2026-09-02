@@ -11,6 +11,7 @@
 #include <expected>
 #include <filesystem>
 #include <format>
+#include <future>
 #include <optional>
 #include <string>
 #include <vector>
@@ -21,70 +22,9 @@
 #include "geometry.hxx"
 #include "geometry_arena.hxx"
 #include "material.hxx"
+#include "model_vertex.hxx"
 #include "sampler.hxx"
 #include "texture_streamer.hxx"
-
-struct ModelVertex {
-    glm::vec3 position{};
-    glm::vec3 normal{};
-    glm::vec4 tangent{};
-    glm::vec2 texcoord{};
-};
-constexpr auto default_vertex_description() {
-    std::array<VkVertexInputAttributeDescription, 4> attributes{};
-    attributes[0] = {
-            .location = 0,
-            .binding = 0,
-            .format = VK_FORMAT_R32G32B32_SFLOAT,
-            .offset = offsetof(ModelVertex, position),
-    };
-    attributes[1] = {
-            .location = 1,
-            .binding = 0,
-            .format = VK_FORMAT_R32G32B32_SFLOAT,
-            .offset = offsetof(ModelVertex, normal),
-    };
-    attributes[2] = {
-            .location = 2,
-            .binding = 0,
-            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
-            .offset = offsetof(ModelVertex, tangent),
-    };
-    attributes[3] = {
-            .location = 3,
-            .binding = 0,
-            .format = VK_FORMAT_R32G32_SFLOAT,
-            .offset = offsetof(ModelVertex, texcoord),
-    };
-    std::array<VkVertexInputBindingDescription, 1> bindings{};
-    bindings[0] = {
-            .binding = 0,
-            .stride = sizeof(ModelVertex),
-            .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
-    };
-    return std::pair{attributes, bindings};
-}
-
-
-auto encode_octahedral(glm::vec3 direction) -> glm::vec2;
-auto decode_octahedral(glm::vec2 encoded) -> glm::vec3;
-
-
-#pragma pack(push, 1)
-struct CompressedModelVertex {
-    glm::uint32 normal_oct{}; // packSnorm2x16(encode_octahedral(normal))
-    glm::uint32 tangent_oct{}; // packSnorm2x16(encode_octahedral(tangent.xyz));
-                               // LSB of the packed value doubles as the
-                               // handedness sign (tangent.w < 0 ? 1 : 0)
-    glm::uint16 position_x{}, position_y{}, position_z{}; // half floats
-    glm::uint16 texcoord_u{}, texcoord_v{}; // half floats
-    glm::uint16 pad_{};
-};
-#pragma pack(pop)
-static_assert(sizeof(CompressedModelVertex) == 20);
-
-auto compress_vertex(ModelVertex const &vertex) -> CompressedModelVertex;
-auto compress_vertices(std::span<ModelVertex const> vertices) -> std::vector<CompressedModelVertex>;
 
 struct ModelPrimitive {
     std::array<MeshGeometry, lod_count> lods{};
@@ -241,6 +181,23 @@ auto generate_mesh_lods(std::vector<ModelVertex> const &vertices, std::vector<st
 
 auto load_model_cpu(std::filesystem::path const &path, SamplerStorage &sampler_storage)
         -> std::expected<ModelCpuData, ModelLoadError>;
+
+// Runs load_model_cpu() on thread_pool() instead of blocking the calling
+// thread. GPU uploads aren't safe to issue off the render thread, so this
+// doesn't create a ModelHandle itself -- pair it with
+// IModelSink::create_pending_model()/finish_model_load() (or just use
+// ModelStreamer, which already does this) to get a handle that's usable
+// immediately and upgrades in place once the background work and GPU
+// upload both finish. Bypasses load_model_cpu()'s caller-side path cache --
+// the caller is responsible for not requesting the same path twice
+// concurrently if that matters for their use case.
+//
+// `sampler_storage` must outlive the returned future -- the caller is
+// responsible for waiting on or discarding it before sampler_storage is
+// destroyed.
+[[nodiscard]]
+auto load_model_cpu_async(std::filesystem::path path, SamplerStorage &sampler_storage)
+        -> std::future<std::expected<ModelCpuData, ModelLoadError>>;
 
 // Creates geometry/materials synchronously (needs command_buffer for the
 // former), but textures merely get requested from `texture_streamer` --

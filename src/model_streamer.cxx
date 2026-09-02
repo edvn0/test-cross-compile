@@ -3,18 +3,17 @@
 #include <chrono>
 
 #include "logger.hxx"
-#include "renderer.hxx"
 
-auto ModelStreamer::request(Renderer &renderer, std::filesystem::path source_path, ModelHandle fallback,
+auto ModelStreamer::request(IModelSink &sink, std::filesystem::path source_path, ModelHandle fallback,
                             std::string debug_name) -> ModelHandle {
-    auto pending_handle = renderer.create_pending_model(fallback);
+    auto pending_handle = sink.create_pending_model(fallback);
 
     if (!pending_handle) {
         warn("model_streamer: could not reserve a slot for '{}', staying on its fallback model", debug_name);
         return fallback;
     }
 
-    auto future = renderer.load_model_cpu_async(std::move(source_path));
+    auto future = load_model_cpu_async(std::move(source_path), sink.sampler_storage());
 
     pending_.push_back(PendingRequest{
             .handle = *pending_handle,
@@ -25,7 +24,7 @@ auto ModelStreamer::request(Renderer &renderer, std::filesystem::path source_pat
     return *pending_handle;
 }
 
-auto ModelStreamer::process_ready(Renderer &renderer, VkCommandBuffer command_buffer) -> void {
+auto ModelStreamer::process_ready(IModelSink &sink, VkCommandBuffer command_buffer) -> void {
     ZoneScopedNC("ProcessReadyModels", tracy::Color::Goldenrod);
 
     using namespace std::chrono_literals;
@@ -44,7 +43,7 @@ auto ModelStreamer::process_ready(Renderer &renderer, VkCommandBuffer command_bu
             return true;
         }
 
-        auto finished = renderer.finish_model_load(request.handle, *cpu_data, command_buffer);
+        auto finished = sink.finish_model_load(request.handle, *cpu_data, command_buffer);
 
         if (!finished) {
             error("model_streamer: '{}' failed to finish loading ({}); staying on its fallback model",

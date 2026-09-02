@@ -396,7 +396,7 @@ auto Application::on_startup() -> void {
     std::array const shader_directories{
             std::filesystem::path{"assets/shaders"},
     };
-    if (!shader_watcher_.start(*renderer, shader_directories)) {
+    if (!shader_watcher_.start(renderer->shader_change_queue(), shader_directories)) {
         error("Shader hot-reload watcher failed to start -- shaders will not live-reload this run");
     }
     imgui_renderer = std::make_unique<gui::ImGuiRenderer>(

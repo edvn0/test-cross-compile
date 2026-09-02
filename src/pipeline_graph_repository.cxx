@@ -6,6 +6,7 @@
 #include "error_describe.hxx"
 #include "logger.hxx"
 #include "renderer.hxx"
+#include "thread_pool.hxx"
 
 namespace {
     auto to_lookup_key(std::filesystem::path const &path) -> std::string {
@@ -433,7 +434,7 @@ auto PipelineGraphRepository::register_pipelines_parallel(std::span<PipelineRegi
     }
 
 
-    auto &thread_pool = Renderer::thread_pool();
+    auto &pool = thread_pool();
 
     if (!dirty_stage_indices.empty()) {
         std::vector<std::future<std::expected<renderer::CompiledShader, renderer::ShaderCompileError>>> futures;
@@ -443,7 +444,7 @@ auto PipelineGraphRepository::register_pipelines_parallel(std::span<PipelineRegi
             auto const &request = stage_nodes_[stage_index].request;
 
 
-            futures.push_back(thread_pool.submit_task([&request] { return Renderer::compiler().compile(request); }));
+            futures.push_back(pool.submit_task([&request] { return Renderer::compiler().compile(request); }));
         }
 
 
@@ -537,7 +538,7 @@ auto PipelineGraphRepository::register_pipelines_parallel(std::span<PipelineRegi
 
 
         build_futures.push_back(
-                thread_pool.submit_task([this, node_index] { return build_node(pipeline_nodes_[node_index]); }));
+                pool.submit_task([this, node_index] { return build_node(pipeline_nodes_[node_index]); }));
     }
 
     for (std::size_t k = 0; k < build_order.size(); ++k) {

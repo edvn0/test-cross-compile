@@ -118,6 +118,11 @@ set(
     "Path to a local Slang release archive"
 )
 
+# engine_options only reads the MINGW_VULKAN_* options above; the shared
+# third-party dependency target (engine_deps) is created later, once every
+# CPMAddPackage() it references has run (see the "Core library" section).
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/compiler_options.cmake")
+
 # ------------------------------------------------------------------------------
 # Language configuration
 # ------------------------------------------------------------------------------
@@ -1108,6 +1113,10 @@ file(
     "${CMAKE_CURRENT_SOURCE_DIR}/include/*.hxx"
 )
 
+# engine_deps needs stb_SOURCE_DIR, bullet3_SOURCE_DIR, shader_reflect_generated_dir
+# and slang_root, all resolved above -- must be included after them.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/engine_deps.cmake")
+
 # ------------------------------------------------------------------------------
 # Core library
 # ------------------------------------------------------------------------------
@@ -1125,71 +1134,17 @@ add_library(
     mingw-vulkan-core
 )
 
-target_include_directories(
-    mingw-vulkan-core
-    PUBLIC
-        "${CMAKE_CURRENT_SOURCE_DIR}/include"
-        "${shader_reflect_generated_dir}/include"
-)
-
-# stb is DOWNLOAD_ONLY (no CMake target of its own), so there's nothing for
-# mark_target_includes_system() to act on -- SYSTEM has to be requested
-# directly on this include path instead, same reasoning as bullet3 below.
-target_include_directories(
-    mingw-vulkan-core
-    SYSTEM
-    PRIVATE
-        "${stb_SOURCE_DIR}"
-)
-
 add_dependencies(
     mingw-vulkan-core
     generate_shader_push_constants
 )
 
-# Bullet's own CMakeLists uses directory-scoped INCLUDE_DIRECTORIES() rather
-# than target_include_directories(), so its include path never reaches
-# downstream targets via target_link_libraries() -- add it explicitly.
-target_include_directories(
-    mingw-vulkan-core
-    SYSTEM
-    PRIVATE
-        "${bullet3_SOURCE_DIR}/src"
-)
-
-#
-# These are intentionally PUBLIC for the initial core-library refactor.
-#
-# The old executable target received this entire dependency environment
-# directly. Making it PUBLIC here preserves that behaviour for consumers of
-# mingw-vulkan-core, including mingw-vulkan itself and the test targets.
-#
-# Individual libraries can later be tightened to PRIVATE where no public
-# project header exposes them.
-#
 target_link_libraries(
     mingw-vulkan-core
     PUBLIC
-        Vulkan::Headers
-        volk::volk
-        glfw
-        BulletDynamics
-        BulletCollision
-        LinearMath
-        spdlog::spdlog
-        GPUOpen::VulkanMemoryAllocator
-        fastgltf::fastgltf
-        glm::glm
-        EnTT::EnTT
-        slang::headers
-        mikktspace::mikktspace
-        meshoptimizer
-        efsw
-        imgui
-        tinyexr
-        ktx
-        BS_thread_pool
-        TracyClient
+        engine_deps
+    PRIVATE
+        engine_options
 )
 
 target_precompile_headers(
@@ -1197,31 +1152,6 @@ target_precompile_headers(
     PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/include/pch.hxx"
 )
-
-target_compile_definitions(
-    mingw-vulkan-core
-    PUBLIC
-        VK_NO_PROTOTYPES
-        GLFW_INCLUDE_NONE
-        GLM_FORCE_RADIANS
-        GLM_FORCE_DEPTH_ZERO_TO_ONE
-        GLM_ENABLE_EXPERIMENTAL
-        SLANG_ROOT_PATH="${slang_root}"
-)
-
-if(MINGW_VULKAN_ENABLE_VALIDATION)
-  target_compile_definitions(
-      mingw-vulkan-core
-      PUBLIC
-          MINGW_VULKAN_ENABLE_VALIDATION=1
-  )
-else()
-  target_compile_definitions(
-      mingw-vulkan-core
-      PUBLIC
-          MINGW_VULKAN_ENABLE_VALIDATION=0
-  )
-endif()
 
 if(mingw_vulkan_track_memory)
   target_compile_definitions(
@@ -1267,22 +1197,6 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_BUILD_TYPE STREQUAL "Release")
   endif()
 endif()
 
-# The error-context types (ErrorContext and the *Error aggregates' `.cause`/
-# `.context` fields) are deliberately optional trailing members with defaults
-# -- callers only ever fill in what's relevant to that failure. GCC's
-# -Wmissing-field-initializers fires on every designated-init that omits them
-# even though a default member initializer exists, which isn't a real bug.
-target_compile_options(
-    mingw-vulkan-core
-    PRIVATE
-        -Wno-missing-field-initializers
-        -Wno-old-style-cast
-)
-
-include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/compiler_options.cmake")
-
-configure_compiler_options(mingw-vulkan-core)
-
 # ------------------------------------------------------------------------------
 # RenderDoc
 #
@@ -1318,6 +1232,7 @@ target_link_libraries(
     mingw-vulkan
     PRIVATE
         mingw-vulkan::core
+        engine_options
 )
 
 target_include_directories(
@@ -1325,14 +1240,6 @@ target_include_directories(
     PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/game/include"
 )
-
-#
-# Keep the same project compiler options on the executable's own sources as
-# well. The majority of the source tree is compiled by mingw-vulkan-core, but
-# the executable should not silently use a different warning/exception/RTTI
-# configuration.
-#
-configure_compiler_options(mingw-vulkan)
 
 # If these sources rely on the project PCH, retain the same behaviour they had
 # when all sources belonged to the executable target.

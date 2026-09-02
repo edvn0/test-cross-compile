@@ -3,7 +3,7 @@
 #include <chrono>
 
 #include "logger.hxx"
-#include "renderer.hxx"
+#include "thread_pool.hxx"
 
 auto TextureStreamer::request(ImageStorage &images, std::filesystem::path source_path, TextureRole role,
                               ImageHandle fallback, std::string debug_name) -> ImageHandle {
@@ -14,7 +14,7 @@ auto TextureStreamer::request(ImageStorage &images, std::filesystem::path source
         return fallback;
     }
 
-    auto &pool = Renderer::thread_pool();
+    auto &pool = thread_pool();
 
     auto future =
             pool.submit_task([path = std::move(source_path), role]() { return load_compressed_texture(path, role); });
@@ -38,7 +38,7 @@ auto TextureStreamer::request_from_memory(ImageStorage &images, std::vector<std:
         return fallback;
     }
 
-    auto &pool = Renderer::thread_pool();
+    auto &pool = thread_pool();
 
     auto future = pool.submit_task([encoded = std::move(encoded_bytes), role, cache_key = std::move(cache_key)]() {
         return load_compressed_texture_from_encoded_memory(encoded, role, cache_key);

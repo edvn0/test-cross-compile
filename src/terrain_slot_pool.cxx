@@ -3,7 +3,6 @@
 #include "config.hxx"
 #include "error_describe.hxx"
 #include "logger.hxx"
-#include "renderer.hxx"
 
 #include <algorithm>
 
@@ -25,7 +24,7 @@ namespace {
 
 } // namespace
 
-auto TerrainSlotPool::create(Renderer &renderer, VkCommandBuffer command_buffer,
+auto TerrainSlotPool::create(IMeshSink &mesh_sink, VkCommandBuffer command_buffer,
                              TerrainSlotPoolCreateInfo const &create_info)
         -> std::expected<TerrainSlotPool, TerrainSlotPoolError> {
 
@@ -34,7 +33,7 @@ auto TerrainSlotPool::create(Renderer &renderer, VkCommandBuffer command_buffer,
     pool.free_by_lod_.resize(create_info.lod_levels);
 
     auto const &canonical_indices = terrain_chunk_indices();
-    auto index_slice = renderer.geometry_arena().allocate_indices(command_buffer, std::span{canonical_indices});
+    auto index_slice = mesh_sink.geometry_arena().allocate_indices(command_buffer, std::span{canonical_indices});
 
     if (!index_slice) {
         return std::unexpected(TerrainSlotPoolError{
@@ -52,7 +51,7 @@ auto TerrainSlotPool::create(Renderer &renderer, VkCommandBuffer command_buffer,
         auto const [bounds_min, bounds_max] = slot_bounds(create_info, lod);
 
         for (std::uint32_t slot = 0; slot < create_info.slots_per_lod; ++slot) {
-            auto vertex_slice = renderer.geometry_arena().allocate_vertices(command_buffer, std::span{placeholder});
+            auto vertex_slice = mesh_sink.geometry_arena().allocate_vertices(command_buffer, std::span{placeholder});
 
             if (!vertex_slice) {
                 return std::unexpected(TerrainSlotPoolError{
@@ -70,7 +69,7 @@ auto TerrainSlotPool::create(Renderer &renderer, VkCommandBuffer command_buffer,
             };
             submesh.lods.fill(geometry); // no per-LOD simplification -- chunk LOD is the only LOD (see the plan)
 
-            auto mesh = renderer.create_mesh(MeshCreateInfo{.submeshes = std::span{&submesh, 1}});
+            auto mesh = mesh_sink.create_mesh(MeshCreateInfo{.submeshes = std::span{&submesh, 1}});
 
             if (!mesh) {
                 return std::unexpected(TerrainSlotPoolError{
@@ -99,7 +98,7 @@ auto TerrainSlotPool::acquire(std::uint8_t lod) -> std::optional<TerrainSlotHand
     return TerrainSlotHandle{.index = slot_index};
 }
 
-auto TerrainSlotPool::write(Renderer &renderer, VkCommandBuffer command_buffer, TerrainSlotHandle handle,
+auto TerrainSlotPool::write(IMeshSink &mesh_sink, VkCommandBuffer command_buffer, TerrainSlotHandle handle,
                             std::span<CompressedModelVertex const> vertices) -> bool {
 
     if (!handle.valid() || handle.index >= slots_.size() ||
@@ -108,7 +107,7 @@ auto TerrainSlotPool::write(Renderer &renderer, VkCommandBuffer command_buffer, 
     }
 
     auto const &slot = slots_[handle.index];
-    auto written = renderer.geometry_arena().rewrite_slice(command_buffer, slot.vertex_bytes, std::as_bytes(vertices));
+    auto written = mesh_sink.geometry_arena().rewrite_slice(command_buffer, slot.vertex_bytes, std::as_bytes(vertices));
 
     if (!written) {
         error("terrain_slot_pool: rewrite_slice failed for slot {} (lod={}): {}", handle.index, slot.lod,

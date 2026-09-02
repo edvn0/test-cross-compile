@@ -26,6 +26,7 @@
 #include "renderer_application_policy.hxx"
 #include "sampler_storage.hxx"
 #include "slang_compiler.hxx"
+#include "thread_pool.hxx"
 #include "vk_barrier.hxx"
 
 // ForwardPushConstants, ShadowPushConstants, CompositePushConstants,
@@ -201,11 +202,6 @@ namespace {
 } // namespace
 
 Renderer::Renderer(VulkanContext &context) noexcept : context_(context) {}
-
-auto Renderer::thread_pool() noexcept -> BS::priority_thread_pool & {
-    static auto thread_pool_ = std::make_unique<BS::priority_thread_pool>(std::thread::hardware_concurrency());
-    return *thread_pool_;
-}
 
 auto Renderer::compiler() noexcept -> renderer::SlangCompiler & {
     static auto compiler_ =
@@ -1341,16 +1337,6 @@ auto Renderer::load_model(std::filesystem::path const &path) -> std::expected<Mo
     model_cache_[file_hash] = *model_result;
 
     return model_result;
-}
-
-auto Renderer::load_model_cpu_async(std::filesystem::path path)
-        -> std::future<std::expected<ModelCpuData, ModelLoadError>> {
-    // sampler_storage_ is only read here (nearest/linear clamp/repeat are
-    // fixed defaults resolved once at Renderer::initialize, never mutated
-    // afterwards -- see SamplerStorage), so calling load_model_cpu()
-    // concurrently with anything the render thread does to sampler_storage_
-    // is safe without additional synchronization.
-    return thread_pool().submit_task([this, path = std::move(path)] { return load_model_cpu(path, sampler_storage_); });
 }
 
 auto Renderer::create_model_from_cpu_data(ModelCpuData const &cpu_data) -> std::expected<ModelHandle, RendererError> {

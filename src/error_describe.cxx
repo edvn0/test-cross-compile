@@ -3,24 +3,7 @@
 #include <format>
 #include <variant>
 
-#include "device_error.hxx"
-#include "forward_target.hxx"
-#include "geometry_arena.hxx"
-#include "gpu_resource_table.hxx"
-#include "image.hxx"
-#include "image_storage.hxx"
-#include "load_model.hxx"
-#include "material_storage.hxx"
-#include "pipeline.hxx"
-#include "pipeline_graph_repository.hxx"
-#include "pipeline_storage.hxx"
-#include "renderer.hxx"
-#include "sampler_storage.hxx"
-#include "shader_object.hxx"
-#include "shader_object_storage.hxx"
-#include "slang_compiler.hxx"
-#include "slang_library.hxx"
-#include "texture_pipeline.hxx"
+#include "renderer_error.hxx"
 
 // Phase 0 of the error-context redesign: these describe() overloads read the
 // *current* struct layouts (a `.type` tag plus always-present nested error
@@ -29,7 +12,14 @@
 // immediately. Once a given aggregate is migrated to `{type; optional<ErrorCause>
 // cause;}` (see error_context.hxx), its describe() collapses to the
 // `cause ? describe(*cause) : head` shape shown for ErrorCause below.
-
+//
+// Every other describe() overload is defined next to its own error type
+// (e.g. describe(ImageError) lives in gpu_error_describe.cxx) -- declared
+// here (via error_types.def) but defined per-module, so no module needs to
+// see every other module's error headers just to log an error. This file
+// keeps only the describe() overloads for the two generic, module-agnostic
+// error types (ErrorContext/ErrorCause) plus RendererError, which needs
+// nothing beyond its own header and the generic ErrorCause describer.
 auto describe(ErrorContext const &context) -> std::string {
     std::string text = context.message.empty() ? std::string{"(no message)"} : std::string{context.message.view()};
 
@@ -63,183 +53,6 @@ auto describe(ErrorCause const &cause) -> std::string {
                 }
             },
             cause);
-}
-
-auto describe(DeviceError const &error) -> std::string {
-    auto const message = error.message.empty() ? std::string_view{"(no message)"} : error.message.view();
-
-    return std::format("DeviceError({}): {} [VkResult={}] ({}:{})", error.type, message,
-                       static_cast<int>(error.vk_result), error.location.file_name(), error.location.line());
-}
-
-auto describe(ImageError const &error) -> std::string {
-    auto head = std::format("ImageError({})", error.type);
-
-    if (error.cause.has_value()) {
-        return head + " -> " + describe(*error.cause);
-    }
-
-    return head;
-}
-
-auto describe(ImageStorageError const &error) -> std::string {
-    auto head = std::format("ImageStorageError({})", error.type);
-
-    if (error.cause.has_value()) {
-        return head + " -> " + describe(*error.cause);
-    }
-
-    return head;
-}
-
-auto describe(GeometryArenaError const &error) -> std::string {
-    auto head = std::format("GeometryArenaError({})", error.type);
-
-    if (error.cause.has_value()) {
-        return head + " -> " + describe(*error.cause);
-    }
-
-    return head;
-}
-
-auto describe(MaterialStorageError const &error) -> std::string {
-    auto head = std::format("MaterialStorageError({})", error.type);
-
-    if (error.cause.has_value()) {
-        return head + " -> " + describe(*error.cause);
-    }
-
-    return head;
-}
-
-auto describe(PipelineError const &error) -> std::string {
-    auto head = std::format("PipelineError({})", error.type);
-
-    if (error.context.has_value()) {
-        return head + " -> " + describe(*error.context);
-    }
-
-    return head;
-}
-
-auto describe(PipelineStorageError const &error) -> std::string {
-    auto head = std::format("PipelineStorageError({})", error.type);
-
-    if (error.cause.has_value()) {
-        return head + " -> " + describe(*error.cause);
-    }
-
-    return head;
-}
-
-auto describe(PipelineGraphError const &error) -> std::string {
-    auto head = std::format("PipelineGraphError({})", error.type);
-
-    if (error.cause.has_value()) {
-        return head + " -> " + describe(*error.cause);
-    }
-
-    return head;
-}
-
-auto describe(ShaderObjectError const &error) -> std::string {
-    auto head = std::format("ShaderObjectError({})", error.type);
-
-    if (error.context.has_value()) {
-        return head + " -> " + describe(*error.context);
-    }
-
-    return head;
-}
-
-auto describe(ShaderObjectStorageError const &error) -> std::string {
-    auto head = std::format("ShaderObjectStorageError({})", error.type);
-
-    if (error.cause.has_value()) {
-        return head + " -> " + describe(*error.cause);
-    }
-
-    return head;
-}
-
-auto describe(ForwardTargetError const &error) -> std::string {
-    auto head = std::format("ForwardTargetError({})", error.type);
-
-    if (error.cause.has_value()) {
-        return head + " -> " + describe(*error.cause);
-    }
-
-    return head;
-}
-
-auto describe(GpuResourceTableError const &error) -> std::string {
-    auto head = std::format("GpuResourceTableError({})", error.type);
-
-    if (error.context.has_value()) {
-        return head + " -> " + describe(*error.context);
-    }
-
-    return head;
-}
-
-auto describe(SamplerStorageError const &error) -> std::string {
-    auto head = std::format("SamplerStorageError({})", error.type);
-
-    if (error.context.has_value()) {
-        return head + " -> " + describe(*error.context);
-    }
-
-    return head;
-}
-
-auto describe(ModelLoadError const &error) -> std::string {
-    auto head = std::format("ModelLoadError({})", error.type);
-
-    if (error.cause.has_value()) {
-        return head + " -> " + describe(*error.cause);
-    }
-
-    return head;
-}
-
-auto describe(TexturePipelineError const &error) -> std::string {
-    auto head = std::format("TexturePipelineError({})", error.type);
-
-    if (error.cause.has_value()) {
-        return head + " -> " + describe(*error.cause);
-    }
-
-    return head;
-}
-
-auto describe(SlangLibraryError const &error) -> std::string {
-    auto head = std::format("SlangLibraryError({})", error.type);
-
-    if (error.result != SLANG_OK) {
-        head += std::format(" [SlangResult={}]", static_cast<int>(error.result));
-    }
-
-    if (!error.diagnostics.empty()) {
-        head += "\n";
-        head += error.diagnostics;
-    }
-
-    return head;
-}
-
-auto describe(renderer::ShaderCompileError const &error) -> std::string {
-    auto head = std::format("ShaderCompileError({})", error.type);
-
-    if (error.result != SLANG_OK) {
-        head += std::format(" [SlangResult={}]", static_cast<int>(error.result));
-    }
-
-    if (!error.diagnostics.empty()) {
-        head += "\n";
-        head += error.diagnostics;
-    }
-
-    return head;
 }
 
 auto describe(RendererError const &error) -> std::string {

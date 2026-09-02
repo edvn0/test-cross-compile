@@ -6,13 +6,13 @@
 #include <memory>
 #include <vector>
 
-#include "renderer.hxx"
 #include "terrain_chunk.hxx"
 #include "terrain_mesh.hxx"
 #include "terrain_quadtree.hxx"
+#include "thread_pool.hxx"
 
-// Kicks off async chunk generation (make_terrain_chunk) on
-// Renderer::thread_pool(), mirroring TextureStreamer/ModelStreamer's
+// Kicks off async chunk generation (make_terrain_chunk) on thread_pool(),
+// mirroring TextureStreamer/ModelStreamer's
 // submit-then-drain pattern (reserve nothing eagerly, poll futures with
 // wait_for(0s) each frame, no mutex, no result queue -- see
 // src/texture_streamer.cxx). There is no "pending" placeholder to render
@@ -36,7 +36,7 @@ public:
             return false;
         }
 
-        auto &pool = Renderer::thread_pool();
+        auto &pool = thread_pool();
         auto future = pool.submit_task(
                 [field = std::move(field), request]() { return make_terrain_chunk(*field, request); }, BS::pr::low);
 

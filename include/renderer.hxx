@@ -35,8 +35,11 @@
 #include "image_storage.hxx"
 #include "load_model.hxx"
 #include "material_storage.hxx" // TextureHandle, MaterialCreateInfo now live here
+#include "mesh_create_info.hxx"
+#include "mesh_sink.hxx"
 #include "mesh_storage.hxx"
 #include "model.hxx"
+#include "model_sink.hxx"
 #include "model_storage.hxx"
 #include "model_streamer.hxx"
 #include "pipeline_graph_repository.hxx"
@@ -129,24 +132,6 @@ struct PipelineStats {
     std::uint64_t fragment_shader_invocation_count = 0;
 
     bool valid = false;
-};
-
-struct SubmeshCreateInfo {
-    // One MeshGeometry per LOD level (lods[0] is full detail, always
-    // required). Levels without a distinct simplification may alias an
-    // earlier level's geometry.
-    std::array<MeshGeometry, lod_count> lods{};
-    MaterialHandle material{};
-
-    // Local-space (untransformed) AABB over this submesh's own vertices,
-    // used as the culling volume for GPU frustum culling. Shared across all
-    // LODs.
-    glm::vec3 bounds_min{-0.5F};
-    glm::vec3 bounds_max{0.5F};
-};
-
-struct MeshCreateInfo {
-    std::span<const SubmeshCreateInfo> submeshes;
 };
 
 struct SwapchainImage {
@@ -248,7 +233,7 @@ struct RendererCreateInfo {
     std::uint32_t maximum_submission_count = 1'000'000;
 };
 
-struct Renderer {
+struct Renderer final : public IMeshSink, public IModelSink {
     explicit Renderer(VulkanContext &context) noexcept;
 
     Renderer(Renderer const &) = delete;
@@ -265,33 +250,11 @@ struct Renderer {
     [[nodiscard]]
     auto load_model(std::filesystem::path const &path) -> std::expected<ModelHandle, RendererError>;
 
-    // Low-level async primitive: runs load_model()'s CPU-heavy work (glTF
-    // parsing, tangent generation, LOD simplification) on thread_pool()
-    // instead of blocking the calling thread. GPU uploads aren't safe to
-    // issue off the render thread, so this doesn't create a ModelHandle
-    // itself -- pair it with create_pending_model()/finish_model_load()
-    // (or just use model_streamer(), which already does this) to get a
-    // handle that's usable immediately and upgrades in place once the
-    // background work and GPU upload both finish. Bypasses load_model()'s
-    // path cache -- the caller is responsible for not requesting the same
-    // path twice concurrently if that matters for their use case.
-    //
-    // Unlike TextureStreamer's requests, this Renderer does not track or
-    // wait on the returned future itself (destroy() only waits on
-    // texture_streamer_/model_streamer_). A caller using this directly
-    // (rather than through model_streamer()) owns the future and must
-    // ensure it has either completed or been discarded before this
-    // Renderer is destroyed -- the background task reads this Renderer's
-    // sampler_storage_, so a still-running task outliving the Renderer is
-    // a use-after-free.
-    [[nodiscard]]
-    auto load_model_cpu_async(std::filesystem::path path) -> std::future<std::expected<ModelCpuData, ModelLoadError>>;
-
     // Reserves a model handle as a copy of `fallback`'s data -- usable
     // immediately (renders and reports bounds as the fallback) -- to be
     // installed into later via finish_model_load(). See ModelStorage::create_pending_model.
     [[nodiscard]]
-    auto create_pending_model(ModelHandle fallback) -> std::expected<ModelHandle, RendererError>;
+    auto create_pending_model(ModelHandle fallback) -> std::expected<ModelHandle, RendererError> override;
 
     // Completes an async load started with load_model_cpu_async(): records
     // the GPU upload (meshes, materials, any embedded textures) into
@@ -303,7 +266,7 @@ struct Renderer {
     // fallback content rather than being torn down.
     [[nodiscard]]
     auto finish_model_load(ModelHandle pending, ModelCpuData const &cpu_data, VkCommandBuffer command_buffer)
-            -> std::expected<void, RendererError>;
+            -> std::expected<void, RendererError> override;
 
     // Uploads already-CPU-side geometry (e.g. procedurally generated engine
     // primitives — see primitive_meshes.hxx / engine_models.hxx) through the
@@ -348,14 +311,14 @@ struct Renderer {
     auto destroy_material(MaterialHandle handle) -> std::expected<void, RendererError>;
 
     [[nodiscard]]
-    auto create_mesh(MeshCreateInfo const &create_info) -> std::expected<MeshHandle, RendererError>;
+    auto create_mesh(MeshCreateInfo const &create_info) -> std::expected<MeshHandle, RendererError> override;
 
     [[nodiscard]]
     auto destroy_mesh(MeshHandle handle) -> std::expected<void, RendererError>;
 
     [[nodiscard]]
     auto submit_mesh(MeshHandle mesh, glm::mat4 const &transform, MaterialHandle material_override = {})
-            -> std::expected<void, RendererError>;
+            -> std::expected<void, RendererError> override;
 
     struct CameraMatrices {
         glm::mat4 view;
@@ -460,11 +423,11 @@ struct Renderer {
     }
 
     [[nodiscard]]
-    auto geometry_arena() noexcept -> GeometryArena & {
+    auto geometry_arena() noexcept -> GeometryArena & override {
         return geometry_arena_;
     }
 
-    auto notify_shader_file_changed(std::filesystem::path path) -> void { shader_change_queue_.push(std::move(path)); }
+    [[nodiscard]] auto shader_change_queue() noexcept -> ShaderChangeQueue & { return shader_change_queue_; }
 
 
     [[nodiscard]] auto aspect(std::uint32_t index) const -> float {
@@ -481,7 +444,7 @@ struct Renderer {
     [[nodiscard]] auto samples() const noexcept { return frames_[0].forward_target.samples(); }
 
     [[nodiscard]] auto image_storage() noexcept -> ImageStorage & { return image_storage_; }
-    [[nodiscard]] auto sampler_storage() noexcept -> SamplerStorage & { return sampler_storage_; }
+    [[nodiscard]] auto sampler_storage() noexcept -> SamplerStorage & override { return sampler_storage_; }
     [[nodiscard]] auto texture_streamer() noexcept -> TextureStreamer & { return texture_streamer_; }
     [[nodiscard]] auto model_streamer() noexcept -> ModelStreamer & { return model_streamer_; }
     [[nodiscard]] auto resource_table() noexcept -> GpuResourceTable & { return gpu_resource_table_; }
@@ -516,7 +479,6 @@ struct Renderer {
     auto mark_lights_dirty() -> void { lights_dirty_mask_ = frames_.empty() ? 0U : ((1U << frames_.size()) - 1U); }
     auto wait_idle() -> std::expected<void, RendererError>;
 
-    static auto thread_pool() noexcept -> BS::priority_thread_pool &;
     static auto compiler() noexcept -> renderer::SlangCompiler &;
 
 private:
@@ -901,56 +863,4 @@ private:
     ScreenshotCapture screenshot_;
 
     bool initialized_ = false;
-};
-
-template<>
-struct std::formatter<RendererErrorType> : std::formatter<std::string_view> {
-    constexpr auto format(RendererErrorType error, std::format_context &context) const {
-        auto const name = [&]() constexpr -> std::string_view {
-            switch (error) {
-                case RendererErrorType::invalid_argument:
-                    return "invalid_argument";
-                case RendererErrorType::invalid_mesh:
-                    return "invalid_mesh";
-                case RendererErrorType::invalid_model:
-                    return "invalid_model";
-                case RendererErrorType::invalid_material:
-                    return "invalid_material";
-                case RendererErrorType::unsupported_index_type:
-                    return "unsupported_index_type";
-                case RendererErrorType::capacity_exceeded:
-                    return "capacity_exceeded";
-                case RendererErrorType::size_overflow:
-                    return "size_overflow";
-                case RendererErrorType::model_load_error:
-                    return "model_load_error";
-                case RendererErrorType::geometry_error:
-                    return "geometry_error";
-                case RendererErrorType::material_error:
-                    return "material_error";
-                case RendererErrorType::image_error:
-                    return "image_error";
-                case RendererErrorType::forward_target_error:
-                    return "forward_target_error";
-                case RendererErrorType::device_error:
-                    return "device_error";
-                case RendererErrorType::pipeline_error:
-                    return "pipeline_error";
-                case RendererErrorType::compiler_error:
-                    return "compiler_error";
-                case RendererErrorType::invalid_pipeline:
-                    return "invalid_pipeline";
-                case RendererErrorType::pipeline_storage_error:
-                    return "pipeline_storage_error";
-                case RendererErrorType::gpu_resource_table_error:
-                    return "gpu_resource_table_error";
-                case RendererErrorType::pipeline_graph_error:
-                    return "pipeline_graph_error";
-            }
-
-            return "unknown_renderer_error";
-        }();
-
-        return std::formatter<std::string_view>::format(name, context);
-    }
 };

@@ -12,8 +12,8 @@
 #include <vector>
 
 #include "context.hxx"
-#include "load_model.hxx"
 #include "logger.hxx"
+#include "model_vertex.hxx"
 #include "vk_object_name.hxx"
 
 namespace {

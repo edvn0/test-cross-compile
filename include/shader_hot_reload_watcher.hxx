@@ -4,7 +4,7 @@
 #include <memory>
 #include <span>
 
-#include "forward.hxx"
+class ShaderChangeQueue;
 
 namespace efsw {
     class FileWatcher;
@@ -21,9 +21,9 @@ public:
     ShaderHotReloadWatcher(ShaderHotReloadWatcher &&other) noexcept;
     auto operator=(ShaderHotReloadWatcher &&other) noexcept -> ShaderHotReloadWatcher &;
 
-    // renderer must outlive this watcher.
+    // change_queue must outlive this watcher.
     [[nodiscard]]
-    auto start(Renderer &renderer, std::span<std::filesystem::path const> directories) -> bool;
+    auto start(ShaderChangeQueue &change_queue, std::span<std::filesystem::path const> directories) -> bool;
 
     auto stop() noexcept -> void;
 

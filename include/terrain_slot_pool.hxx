@@ -13,11 +13,10 @@
 #include "geometry.hxx"
 #include "load_model.hxx"
 #include "material.hxx"
+#include "mesh_sink.hxx"
 #include "model.hxx"
 #include "terrain_chunk.hxx"
 #include "terrain_quadtree.hxx"
-
-struct Renderer;
 
 struct TerrainSlotPoolError {
     std::string message;
@@ -67,7 +66,7 @@ class TerrainSlotPool {
 public:
     TerrainSlotPool() = default;
 
-    [[nodiscard]] static auto create(Renderer &renderer, VkCommandBuffer command_buffer,
+    [[nodiscard]] static auto create(IMeshSink &mesh_sink, VkCommandBuffer command_buffer,
                                      TerrainSlotPoolCreateInfo const &create_info)
             -> std::expected<TerrainSlotPool, TerrainSlotPoolError>;
 
@@ -81,7 +80,7 @@ public:
     // entries) into `handle`'s existing GPU vertex range in place. Safe to
     // call repeatedly on the same handle; each call fully overwrites the
     // slot's previous contents.
-    [[nodiscard]] auto write(Renderer &renderer, VkCommandBuffer command_buffer, TerrainSlotHandle handle,
+    [[nodiscard]] auto write(IMeshSink &mesh_sink, VkCommandBuffer command_buffer, TerrainSlotHandle handle,
                              std::span<CompressedModelVertex const> vertices) -> bool;
 
     // Marks `handle` free again after frames_in_flight further

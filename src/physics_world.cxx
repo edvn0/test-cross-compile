@@ -12,10 +12,11 @@
 #include <LinearMath/btThreads.h>
 
 #include "arena_allocator.hxx"
-#include "components.hxx"
-#include "debug_renderer.hxx"
+#include "debug_lines.hxx"
 #include "logger.hxx"
 #include "memory_tracker.hxx"
+#include "physics_components.hxx"
+#include "transform.hxx"
 
 #include <algorithm>
 #include <vector>
@@ -191,7 +192,7 @@ struct PhysicsWorld::Impl {
 
     std::vector<TerrainColliderSlot> terrain_colliders;
 
-    debug_draw::DebugRenderer *debug_renderer = nullptr;
+    IDebugLines *debug_lines = nullptr;
 
     ThreadPoolTaskScheduler task_scheduler; // must outlive world; declared before it, constructed first
 
@@ -474,15 +475,15 @@ auto PhysicsWorld::unbind_terrain_collider(TerrainColliderHandle handle) -> void
     slot.active = false;
 }
 
-auto PhysicsWorld::attach_debug_drawer(debug_draw::DebugRenderer &renderer) -> void {
-    impl_->debug_renderer = &renderer;
-    impl_->world->setDebugDrawer(renderer.bullet_debug_draw());
+auto PhysicsWorld::attach_debug_drawer(IDebugLines &debug_lines) -> void {
+    impl_->debug_lines = &debug_lines;
+    impl_->world->setDebugDrawer(debug_lines.bullet_debug_draw());
 }
 
 auto PhysicsWorld::detach_debug_drawer() -> void {
     impl_->world->setDebugDrawer(nullptr);
-    impl_->debug_renderer->clear_lines();
-    impl_->debug_renderer = nullptr;
+    impl_->debug_lines->clear_lines();
+    impl_->debug_lines = nullptr;
 }
 
 auto PhysicsWorld::step(entt::registry &registry, float delta_time) -> void {
@@ -506,8 +507,8 @@ auto PhysicsWorld::step(entt::registry &registry, float delta_time) -> void {
         transform.rotation = to_glm(world_transform.getRotation());
     }
 
-    if (impl_->debug_renderer != nullptr) {
-        impl_->debug_renderer->begin_frame();
+    if (impl_->debug_lines != nullptr) {
+        impl_->debug_lines->begin_frame();
         impl_->world->debugDrawWorld();
     }
 }

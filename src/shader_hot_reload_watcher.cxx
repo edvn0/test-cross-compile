@@ -5,22 +5,22 @@
 #include <efsw/efsw.hpp>
 
 #include "logger.hxx"
-#include "renderer.hxx"
+#include "shader_change_queue.hxx"
 
 struct ShaderHotReloadWatcher::Listener final : efsw::FileWatchListener {
-    explicit Listener(Renderer &r) noexcept : renderer(&r) {}
+    explicit Listener(ShaderChangeQueue &queue) noexcept : change_queue(&queue) {}
 
     auto handleFileAction(efsw::WatchID /*watch_id*/, std::string const &directory, std::string const &filename,
                           efsw::Action action, std::string old_filename) -> void override {
         switch (action) {
             case efsw::Actions::Add:
             case efsw::Actions::Modified:
-                renderer->notify_shader_file_changed(std::filesystem::path{directory} / filename);
+                change_queue->push(std::filesystem::path{directory} / filename);
                 break;
 
             case efsw::Actions::Moved:
-                renderer->notify_shader_file_changed(std::filesystem::path{directory} / old_filename);
-                renderer->notify_shader_file_changed(std::filesystem::path{directory} / filename);
+                change_queue->push(std::filesystem::path{directory} / old_filename);
+                change_queue->push(std::filesystem::path{directory} / filename);
                 break;
 
             case efsw::Actions::Delete:
@@ -31,7 +31,7 @@ struct ShaderHotReloadWatcher::Listener final : efsw::FileWatchListener {
         }
     }
 
-    Renderer *renderer = nullptr;
+    ShaderChangeQueue *change_queue = nullptr;
 };
 
 ShaderHotReloadWatcher::ShaderHotReloadWatcher() = default;
@@ -53,11 +53,12 @@ auto ShaderHotReloadWatcher::operator=(ShaderHotReloadWatcher &&other) noexcept 
     return *this;
 }
 
-auto ShaderHotReloadWatcher::start(Renderer &renderer, std::span<std::filesystem::path const> directories) -> bool {
+auto ShaderHotReloadWatcher::start(ShaderChangeQueue &change_queue, std::span<std::filesystem::path const> directories)
+        -> bool {
     stop();
 
     watcher_ = std::make_unique<efsw::FileWatcher>();
-    listener_ = std::make_unique<Listener>(renderer);
+    listener_ = std::make_unique<Listener>(change_queue);
 
     auto any_watched = false;
 
