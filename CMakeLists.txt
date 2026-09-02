@@ -1088,13 +1088,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
   file(
       GLOB_RECURSE platform_sources
       CONFIGURE_DEPENDS
-      "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/windows/*.cxx"
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/assets/platform/windows/*.cxx"
   )
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   file(
       GLOB_RECURSE platform_sources
       CONFIGURE_DEPENDS
-      "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/linux/*.cxx"
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/assets/platform/linux/*.cxx"
   )
 else()
   set(platform_sources "")
@@ -1150,7 +1150,7 @@ target_link_libraries(
 target_precompile_headers(
     mingw-vulkan-core
     PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/pch.hxx"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/core/pch.hxx"
 )
 
 if(mingw_vulkan_track_memory)
@@ -1212,9 +1212,9 @@ include(
 configure_renderdoc(
     mingw-vulkan-core
     REAL_SOURCE
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/renderdoc/renderdoc.cxx"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/renderdoc/renderdoc.cxx"
     STUB_SOURCE
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/renderdoc/stub.cxx"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/renderdoc/stub.cxx"
     INCLUDE_CACHE_VARIABLE
         RENDERDOC_INCLUDE_PATH
 )
@@ -1246,7 +1246,7 @@ target_include_directories(
 target_precompile_headers(
     mingw-vulkan
     PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/pch.hxx"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/core/pch.hxx"
 )
 
 # ------------------------------------------------------------------------------
@@ -1293,7 +1293,7 @@ endif()
 
 set(
     vma_source
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/vma.cxx"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/vma.cxx"
 )
 
 if(EXISTS "${vma_source}")
