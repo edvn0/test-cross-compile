@@ -50,6 +50,7 @@
 #include "gpu/sampler_storage.hxx"
 #include "rendering/forward_target.hxx"
 #include "rendering/pipeline_graph_repository.hxx"
+#include "rendering/render_passes.hxx"
 #include "rendering/render_stage.hxx"
 #include "rendering/script_storage.hxx"
 #include "rendering/shadow_cascades.hxx"
@@ -58,8 +59,14 @@ struct BloomSettings {
     bool enabled = true;
     float threshold = 1.0F;
     float knee = 0.5F;
-    float filter_radius = 0.005F;
-    float intensity = 0.04F;
+
+    // Upsample tent radius in texels of the lower mip; 1.0 is the standard
+    // 3x3 tent.
+    float filter_radius = 1.0F;
+
+    // Scale applied to the accumulated bloom before it is added to the HDR
+    // colour in composite.slang.
+    float intensity = 0.1F;
 };
 
 // GTAO (Ground-Truth Ambient Occlusion, Jimenez et al. 2016): a screen-space
@@ -757,7 +764,7 @@ private:
 
         struct BloomTarget {
             ImageHandle image;
-            std::array<ImageHandle, 4> mip_slots;
+            std::array<ImageHandle, render_pass::bloom_mip_count> mip_slots;
         };
         BloomTarget bloom_target{};
 
@@ -909,6 +916,96 @@ private:
     auto upload_frame_data(VkCommandBuffer command_buffer, RendererFrame &frame) -> std::expected<void, RendererError>;
 
     auto clear_submissions() noexcept -> void;
+
+    // ---- record_frame() and its passes -------------------------------
+    //
+    // record_frame() is just the frame's pass sequence; each record_*_pass
+    // below owns one stage end to end (profiler zone, info struct, error
+    // propagation, any renderer state the pass commits). Passes run in
+    // declaration order, and each one's output feeds the next through its
+    // return value rather than through shared locals.
+
+    // The images this frame's passes read and write, looked up from their
+    // handles and validated once up front. resolved_hdr/resolved_depth are
+    // the single-sample targets later passes sample from -- the MSAA
+    // resolve targets when multisampled, otherwise the same images as
+    // hdr/depth.
+    struct FrameTargets {
+        Image const *hdr = nullptr;
+        Image const *depth = nullptr;
+        Image const *resolved_hdr = nullptr;
+        Image const *resolved_depth = nullptr;
+        ImageHandle resolved_hdr_handle{};
+        ImageHandle resolved_depth_handle{};
+
+        Image const *shadow_atlas = nullptr;
+        Image const *ao_raw = nullptr;
+        Image const *ao_denoised = nullptr;
+        Image const *viewport = nullptr;
+
+        VkExtent2D extent{};
+        bool multisampled = false;
+    };
+
+    // Folds the culled-indirect readback recorded the last time this frame
+    // slot was used into last_frame_stats_.
+    auto consume_culled_readback(RendererFrame &frame) -> void;
+
+    [[nodiscard]]
+    auto resolve_frame_targets(RendererFrame const &frame) const -> std::expected<FrameTargets, RendererError>;
+
+    // The culled, compacted buffers the camera-view passes (depth prepass,
+    // forward) draw from.
+    [[nodiscard]]
+    auto main_view_draws(RendererFrame const &frame) const -> render_pass::DrawBuffers;
+
+    // Opaque/mask/blend batch counts. The culled and un-culled indirect
+    // buffers share this partitioning, so it serves both the main-view
+    // passes and the shadow pass.
+    [[nodiscard]]
+    static auto batch_counts(RendererFrame const &frame) noexcept -> render_pass::DrawCounts;
+
+    [[nodiscard]]
+    auto record_shadow_pass(render_pass::Context const &pass_context, RendererFrame const &frame,
+                            FrameTargets const &targets) -> std::expected<void, RendererError>;
+
+    // Also transitions the forward targets into attachment layouts, since
+    // this is the first pass to render into them.
+    [[nodiscard]]
+    auto record_depth_prepass(render_pass::Context const &pass_context, RendererFrame const &frame,
+                              FrameTargets const &targets) -> std::expected<void, RendererError>;
+
+    // Returns the bindless index the forward pass should sample AO from --
+    // the denoised GTAO output, or the white texture when AO is disabled.
+    [[nodiscard]]
+    auto record_ambient_occlusion_pass(render_pass::Context const &pass_context, RendererFrame const &frame,
+                                       FrameTargets const &targets) -> std::expected<std::uint32_t, RendererError>;
+
+    [[nodiscard]]
+    auto record_forward_pass(render_pass::Context const &pass_context, RendererFrame const &frame,
+                             FrameTargets const &targets, std::uint32_t ao_texture_index,
+                             render_pass::Callback debug_overlay)
+            -> std::expected<render_pass::HdrTextureIndex, RendererError>;
+
+    [[nodiscard]]
+    auto record_bloom_pass(render_pass::Context const &pass_context, RendererFrame const &frame,
+                           FrameTargets const &targets, render_pass::HdrTextureIndex hdr)
+            -> std::expected<std::optional<render_pass::BloomTextureIndex>, RendererError>;
+
+    // Tonemaps hdr + bloom. Fullscreen play writes straight into the
+    // swapchain with ui_overlay on top; otherwise the scene goes into the
+    // frame's viewport target and a second pass draws the docked editor UI
+    // onto the swapchain.
+    [[nodiscard]]
+    auto record_composite_pass(render_pass::Context const &pass_context, FrameTargets const &targets,
+                               SwapchainImage const &swapchain_image, render_pass::HdrTextureIndex hdr,
+                               std::optional<render_pass::BloomTextureIndex> bloom, bool fullscreen,
+                               render_pass::Callback ui_overlay) -> std::expected<void, RendererError>;
+
+    // Screenshot copy (if one was requested) or the plain present
+    // transition, then the end-of-frame timestamp.
+    auto record_frame_end(VkCommandBuffer command_buffer, SwapchainImage const &swapchain_image,
+                          std::uint32_t frame_index) -> void;
 
 
     VulkanContext &context_;

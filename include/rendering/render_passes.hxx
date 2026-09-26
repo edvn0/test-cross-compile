@@ -201,12 +201,20 @@ namespace render_pass {
         std::uint32_t ao_sampler_index = 0;
     };
 
+    inline constexpr std::uint32_t bloom_mip_count = 4;
+
+    // Bloom as a mip chain on `target` (half the HDR resolution at mip 0):
+    // bloom_mip_count downsample dispatches (HDR -> mip 0 -> ... ), then
+    // bloom_mip_count - 1 upsample dispatches back up, each accumulating the
+    // level below into the one above. mip_texture_indices[i] must be a
+    // single-mip view of level i registered as both sampled_2d and
+    // storage_2d. Every level is left in SHADER_READ_ONLY_OPTIMAL.
     struct BloomPassInfo {
         bool enabled = true;
 
         HdrTextureIndex input_hdr{};
         Image const *target = nullptr;
-        std::array<std::uint32_t, 4> mip_texture_indices{};
+        std::array<std::uint32_t, bloom_mip_count> mip_texture_indices{};
         VkExtent2D input_extent{};
 
         PipelineNodeHandle downsample_pipeline{};
@@ -216,7 +224,9 @@ namespace render_pass {
 
         float threshold = 1.0F;
         float knee = 0.5F;
-        float filter_radius = 0.005F;
+
+        // Upsample tent radius, in texels of the lower level.
+        float filter_radius = 1.0F;
     };
 
     struct CompositePassInfo {

@@ -642,7 +642,7 @@ auto Renderer::initialize(RendererCreateInfo const &create_info) -> std::expecte
             .depth_format = VK_FORMAT_UNDEFINED,
             .stencil_format = VK_FORMAT_UNDEFINED,
             .samples = VK_SAMPLE_COUNT_1_BIT,
-            .debug_name = "renderer.bloom_downsample_pipeline",
+            .debug_name = "renderer.bloom_upsample_pipeline",
     });
 
     pipeline_infos.push_back(PipelineRegisterInfo{
@@ -1118,7 +1118,7 @@ auto Renderer::initialize(RendererCreateInfo const &create_info) -> std::expecte
                 .flags = 0,
                 .samples = VK_SAMPLE_COUNT_1_BIT,
                 .tiling = VK_IMAGE_TILING_OPTIMAL,
-                .mip_levels = 4,
+                .mip_levels = render_pass::bloom_mip_count,
                 .array_layers = 1,
                 .create_mip_layer_views = true,
                 .debug_name = bloom_target_name,
@@ -1132,7 +1132,7 @@ auto Renderer::initialize(RendererCreateInfo const &create_info) -> std::expecte
 
         auto const *bloom_image_ptr = image_storage_.get(*bloom_image);
 
-        for (std::uint32_t mip = 0; mip < 4; ++mip) {
+        for (std::uint32_t mip = 0; mip < render_pass::bloom_mip_count; ++mip) {
             auto const view = bloom_image_ptr->mip_layer_view(mip, 0);
 
             auto mip_slot = image_storage_.register_view(ImageViewRegistration{
@@ -2943,6 +2943,377 @@ auto Renderer::prepare_frame(VkCommandBuffer command_buffer, CameraMatrices cons
     return {};
 }
 
+auto Renderer::consume_culled_readback(RendererFrame &frame) -> void {
+    // Same "safe once this frame-in-flight slot's fence has been waited on"
+    // point screenshot_.try_resolve() relies on -- the copy recorded in
+    // prepare_frame's Culling region the last time this frame_index was
+    // used has long since completed on the GPU by now. See
+    // RendererFrame::culled_readback_buffer's comment for the resulting lag.
+    if (!frame.culled_readback_pending) {
+        return;
+    }
+
+    frame.culled_readback_pending = false;
+
+    if (auto invalidated = frame.culled_readback_buffer.invalidate(
+                0, static_cast<VkDeviceSize>(frame.culled_readback_count) * sizeof(GpuDrawCommand));
+        !invalidated) {
+        error("[Renderer] Failed to invalidate culled-indirect readback buffer");
+        return;
+    }
+
+    auto const *commands = frame.culled_readback_buffer.mapped_data_as<GpuDrawCommand const>();
+    if (commands == nullptr) {
+        return;
+    }
+
+    std::uint32_t visible_instance_count = 0;
+
+    for (std::uint32_t i = 0; i < frame.culled_readback_count; ++i) {
+        visible_instance_count += commands[i].instance_count;
+    }
+
+    last_frame_stats_.visible_instance_count = visible_instance_count;
+}
+
+auto Renderer::resolve_frame_targets(RendererFrame const &frame) const -> std::expected<FrameTargets, RendererError> {
+    bool const multisampled = frame.forward_target.is_multisampled();
+
+    auto const hdr_handle = frame.forward_target.hdr();
+    auto const depth_handle = frame.forward_target.depth();
+    auto const resolved_hdr_handle = multisampled ? frame.forward_target.resolved_hdr() : hdr_handle;
+    auto const resolved_depth_handle = multisampled ? frame.forward_target.resolved_depth() : depth_handle;
+
+    FrameTargets const targets{
+            .hdr = image_storage_.get(hdr_handle),
+            .depth = image_storage_.get(depth_handle),
+            .resolved_hdr = image_storage_.get(resolved_hdr_handle),
+            .resolved_depth = image_storage_.get(resolved_depth_handle),
+            .resolved_hdr_handle = resolved_hdr_handle,
+            .resolved_depth_handle = resolved_depth_handle,
+            .shadow_atlas = image_storage_.get(shadow_atlas_),
+            .ao_raw = image_storage_.get(frame.ao_target.raw),
+            .ao_denoised = image_storage_.get(frame.ao_target.denoised),
+            .viewport = image_storage_.get(frame.viewport_target),
+            .extent = frame.forward_target.extent(),
+            .multisampled = multisampled,
+    };
+
+    auto const usable = [](Image const *image) { return image != nullptr && image->valid(); };
+
+    if (!usable(targets.hdr) || !usable(targets.depth) || !usable(targets.resolved_hdr) ||
+        !usable(targets.resolved_depth) || !usable(targets.shadow_atlas) || !usable(targets.ao_raw) ||
+        !usable(targets.ao_denoised) || !usable(targets.viewport)) {
+        return std::unexpected(make_error(RendererErrorType::image_error));
+    }
+
+    auto const matches_extent = [&](Image const &image) {
+        return image.extent_2d().width == targets.extent.width && image.extent_2d().height == targets.extent.height;
+    };
+
+    if (targets.extent.width == 0 || targets.extent.height == 0 || !matches_extent(*targets.hdr) ||
+        !matches_extent(*targets.depth)) {
+        return std::unexpected(make_error(RendererErrorType::invalid_argument));
+    }
+
+    return targets;
+}
+
+auto Renderer::main_view_draws(RendererFrame const &frame) const -> render_pass::DrawBuffers {
+    return render_pass::DrawBuffers{
+            .draws = frame.visible_draw_buffer,
+            .transforms = frame.visible_transform_buffer,
+            .indirect = frame.culled_indirect_buffer,
+            .index_buffer = geometry_arena_.bindable_buffer(),
+    };
+}
+
+auto Renderer::batch_counts(RendererFrame const &frame) noexcept -> render_pass::DrawCounts {
+    return render_pass::DrawCounts{
+            .opaque = frame.opaque_indirect_count,
+            .mask = frame.mask_indirect_count,
+            .blend = frame.blend_indirect_count,
+    };
+}
+
+auto Renderer::record_shadow_pass(render_pass::Context const &pass_context, RendererFrame const &frame,
+                                  FrameTargets const &targets) -> std::expected<void, RendererError> {
+    TracyVkZoneC(context_.host_query_context.context, pass_context.command_buffer, "Shadow Pass", tracy::Color::Purple);
+
+    auto const frame_index = pass_context.frame_index;
+
+    // Shadows draw every caster, not just what the camera sees, so this
+    // reads the un-culled draw/transform/indirect buffers.
+    auto const result = render_pass::shadow(
+            pass_context,
+            render_pass::ShadowPassInfo{
+                    .shadow_atlas = *targets.shadow_atlas,
+                    .draws =
+                            {
+                                    .draws = frame.draw_buffer,
+                                    .transforms = frame.transform_buffer,
+                                    .indirect = frame.indirect_buffer,
+                                    .index_buffer = geometry_arena_.bindable_buffer(),
+                            },
+                    .counts = batch_counts(frame),
+                    .opaque_cascade_counts = frame.shadow_opaque_indirect_count,
+                    .mask_cascade_counts = frame.shadow_mask_indirect_count,
+                    .update_mask = frame.shadow_update_mask,
+                    .preserve_contents = shadow_atlas_initialized_,
+                    .meshlet_culling = meshlet_culling_,
+                    .cascade_cull_planes_address = frame.frustum_planes_buffer.device_address + 6 * sizeof(glm::vec4),
+                    .materials_address = material_storage_.device_address(),
+                    .ubo_address = ubos_[frame_index].device_address,
+                    .lights_address = frame.lights_buffer.device_address,
+                    .opaque_pipeline = shadow_pipeline_,
+                    .mask_pipeline = shadow_mask_pipeline_,
+                    .opaque_instanced_pipeline = shadow_instanced_pipeline_,
+                    .mask_instanced_pipeline = shadow_mask_instanced_pipeline_,
+                    .depth_bias_constant = shadow_settings_.depth_bias_constant,
+                    .depth_bias_slope = shadow_settings_.depth_bias_slope,
+            });
+
+    if (!result) {
+        return std::unexpected(result.error());
+    }
+
+    if (frame.shadow_update_mask == 0) {
+        return {};
+    }
+
+    // The cascades were re-rendered, so what prepare_frame staged for them
+    // is now what the atlas holds.
+    for (std::uint32_t cascade = 0; cascade < shadow_cascade_count; ++cascade) {
+        if ((frame.shadow_update_mask & (ShadowCascadeMask{1} << cascade)) != 0) {
+            shadow_cascade_cache_[cascade] = frame.pending_shadow_cache[cascade];
+        }
+    }
+
+    cached_shadow_light_direction_ = frame.pending_shadow_light_direction;
+    cached_shadow_depth_bias_constant_ = frame.pending_shadow_depth_bias_constant;
+    cached_shadow_depth_bias_slope_ = frame.pending_shadow_depth_bias_slope;
+    cached_shadow_caster_revision_ = frame.pending_shadow_caster_revision;
+    shadow_scene_signature_ = frame.pending_shadow_scene_signature;
+    shadow_scene_signature_valid_ = true;
+    shadow_global_state_valid_ = true;
+    shadow_atlas_initialized_ = true;
+
+    return {};
+}
+
+auto Renderer::record_depth_prepass(render_pass::Context const &pass_context, RendererFrame const &frame,
+                                    FrameTargets const &targets) -> std::expected<void, RendererError> {
+    render_pass::prepare_forward_targets(
+            pass_context, render_pass::ForwardTargets{
+                                  .hdr = *targets.hdr,
+                                  .depth = *targets.depth,
+                                  .resolved_hdr = targets.multisampled ? targets.resolved_hdr : nullptr,
+                                  .resolved_depth = targets.multisampled ? targets.resolved_depth : nullptr,
+                          });
+
+    TracyVkZoneC(context_.host_query_context.context, pass_context.command_buffer, "Depth Prepass",
+                 tracy::Color::SlateGray);
+
+    auto const frame_index = pass_context.frame_index;
+
+    return render_pass::depth_prepass(pass_context,
+                                      render_pass::DepthPrepassInfo{
+                                              .depth = *targets.depth,
+                                              .resolved_depth = targets.multisampled ? targets.resolved_depth : nullptr,
+                                              .extent = targets.extent,
+                                              .samples = samples_,
+                                              .draws = main_view_draws(frame),
+                                              .counts = batch_counts(frame),
+                                              .cull_planes_address = frame.frustum_planes_buffer.device_address,
+                                              .materials_address = material_storage_.device_address(),
+                                              .ubo_address = ubos_[frame_index].device_address,
+                                              .lights_address = frame.lights_buffer.device_address,
+                                              .opaque_pipeline = depth_prepass_pipeline_,
+                                              .mask_pipeline = depth_prepass_mask_pipeline_,
+                                              .opaque_instanced_pipeline = depth_prepass_instanced_pipeline_,
+                                              .mask_instanced_pipeline = depth_prepass_mask_instanced_pipeline_,
+                                              .meshlet_culling = meshlet_culling_,
+                                      });
+}
+
+auto Renderer::record_ambient_occlusion_pass(render_pass::Context const &pass_context, RendererFrame const &frame,
+                                             FrameTargets const &targets)
+        -> std::expected<std::uint32_t, RendererError> {
+    TracyVkZoneC(context_.host_query_context.context, pass_context.command_buffer, "Ambient Occlusion",
+                 tracy::Color::DarkSlateGray);
+
+    auto const ao_output = render_pass::ambient_occlusion(
+            pass_context, render_pass::AmbientOcclusionInfo{
+                                  .enabled = ao_settings_.enabled,
+                                  .depth = *targets.resolved_depth,
+                                  .raw_ao = *targets.ao_raw,
+                                  .denoised_ao = *targets.ao_denoised,
+                                  .extent = targets.extent,
+                                  .depth_texture_index = targets.resolved_depth_handle.index,
+                                  .raw_ao_texture_index = frame.ao_target.raw.index,
+                                  .denoised_ao_texture_index = frame.ao_target.denoised.index,
+                                  .point_sampler_index = sampler_storage_.nearest_clamp().index,
+                                  .ubo_address = ubos_[pass_context.frame_index].device_address,
+                                  .gtao_pipeline = gtao_pipeline_,
+                                  .denoise_pipeline = gtao_denoise_pipeline_,
+                                  .radius_view = ao_settings_.radius,
+                                  .falloff_range = ao_settings_.falloff_range,
+                                  .slice_count = ao_settings_.slice_count,
+                                  .step_count = ao_settings_.step_count,
+                                  .denoise_depth_sigma = ao_settings_.denoise_depth_sigma,
+                          });
+
+    if (!ao_output) {
+        return std::unexpected(ao_output.error());
+    }
+
+    return ao_output->has_value() ? (*ao_output)->index : image_storage_.white().index;
+}
+
+auto Renderer::record_forward_pass(render_pass::Context const &pass_context, RendererFrame const &frame,
+                                   FrameTargets const &targets, std::uint32_t ao_texture_index,
+                                   render_pass::Callback debug_overlay)
+        -> std::expected<render_pass::HdrTextureIndex, RendererError> {
+    TracyVkZoneC(context_.host_query_context.context, pass_context.command_buffer, "Forward Pass",
+                 tracy::Color::RoyalBlue);
+
+    auto const frame_index = pass_context.frame_index;
+
+    return render_pass::forward_geometry(
+            pass_context,
+            render_pass::ForwardGeometryInfo{
+                    .hdr = *targets.hdr,
+                    .depth = *targets.depth,
+                    .resolved_hdr = targets.multisampled ? targets.resolved_hdr : nullptr,
+                    .output_hdr = {.index = targets.resolved_hdr_handle.index},
+                    .extent = targets.extent,
+                    .samples = samples_,
+                    .draws = main_view_draws(frame),
+                    .counts = batch_counts(frame),
+                    .cull_planes_address = frame.frustum_planes_buffer.device_address,
+                    .materials_address = material_storage_.device_address(),
+                    .ubo_address = ubos_[frame_index].device_address,
+                    .lights_address = frame.lights_buffer.device_address,
+                    .light_count = frame.light_count,
+                    .pipeline_statistics_query_pool = pipeline_stat_queries_[frame_index].query_pool,
+                    .meshlet_culling = meshlet_culling_,
+                    .opaque_pipeline = forward_pipeline_,
+                    .blend_pipeline = forward_blend_pipeline_,
+                    .opaque_instanced_pipeline = forward_instanced_pipeline_,
+                    .blend_instanced_pipeline = forward_blend_instanced_pipeline_,
+                    .draw_light_icons = debug_draw_light_icons_,
+                    .light_icon_pipeline = light_icon_pipeline_,
+                    .light_icon_texture_index = light_icon_texture_.index,
+                    .linear_sampler_index = sampler_storage_.linear_clamp().index,
+                    .light_icon_world_size = light_icon_world_size_,
+                    .ao_texture_index = ao_texture_index,
+                    .ao_sampler_index = sampler_storage_.linear_clamp().index,
+            },
+            debug_overlay);
+}
+
+auto Renderer::record_bloom_pass(render_pass::Context const &pass_context, RendererFrame const &frame,
+                                 FrameTargets const &targets, render_pass::HdrTextureIndex hdr)
+        -> std::expected<std::optional<render_pass::BloomTextureIndex>, RendererError> {
+    TracyVkZoneC(context_.host_query_context.context, pass_context.command_buffer, "Bloom Pass", tracy::Color::Orange);
+
+    std::array<std::uint32_t, render_pass::bloom_mip_count> mip_texture_indices{};
+    for (std::uint32_t mip = 0; mip < render_pass::bloom_mip_count; ++mip) {
+        mip_texture_indices[mip] = frame.bloom_target.mip_slots[mip].index;
+    }
+
+    return render_pass::bloom(
+            pass_context,
+            render_pass::BloomPassInfo{
+                    .enabled = bloom_settings_.enabled,
+                    .input_hdr = hdr,
+                    .target = bloom_settings_.enabled ? image_storage_.get(frame.bloom_target.image) : nullptr,
+                    .mip_texture_indices = mip_texture_indices,
+                    .input_extent = targets.extent,
+                    .downsample_pipeline = bloom_downsample_pipeline_,
+                    .upsample_pipeline = bloom_upsample_pipeline_,
+                    .linear_sampler_index = sampler_storage_.linear_clamp().index,
+                    .threshold = bloom_settings_.threshold,
+                    .knee = bloom_settings_.knee,
+                    .filter_radius = bloom_settings_.filter_radius,
+            });
+}
+
+auto Renderer::record_composite_pass(render_pass::Context const &pass_context, FrameTargets const &targets,
+                                     SwapchainImage const &swapchain_image, render_pass::HdrTextureIndex hdr,
+                                     std::optional<render_pass::BloomTextureIndex> bloom, bool fullscreen,
+                                     render_pass::Callback ui_overlay) -> std::expected<void, RendererError> {
+    TracyVkZoneC(context_.host_query_context.context, pass_context.command_buffer, "Composition",
+                 tracy::Color::SeaGreen);
+
+    // Fullscreen play covers the whole swapchain with the game exactly like
+    // this engine always has -- composite() writes the tonemapped scene
+    // straight into the swapchain image and ui_overlay draws directly on
+    // top of it, all in one pass. Any other time (editing, or playing
+    // embedded), the scene instead goes into this frame's offscreen
+    // viewport_target -- which the editor's Viewport panel samples via
+    // ImGui::Image -- and a second, separate pass clears the real swapchain
+    // and draws the full (docked) ImGui frame onto it. See the plan this
+    // shipped under for why: a docked "Viewport" panel is itself a real
+    // ImGui window, so it can't be the thing composite() paints the 3D
+    // scene onto without also being asked to host arbitrary editor chrome
+    // around it.
+    auto const result = render_pass::composite(
+            pass_context,
+            render_pass::CompositePassInfo{
+                    .swapchain_image = fullscreen ? swapchain_image.image : targets.viewport->image(),
+                    .swapchain_view = fullscreen ? swapchain_image.view : targets.viewport->view(),
+                    .extent = fullscreen ? swapchain_image.extent : targets.extent,
+                    .hdr = hdr,
+                    .bloom = bloom,
+                    // The default emissive texture is the renderer's valid black texture.
+                    .bloom_fallback_texture_index = image_storage_.emissive().index,
+                    .linear_sampler_index = sampler_storage_.linear_clamp().index,
+                    .pipeline = composite_pipeline_,
+                    .exposure = 1.0F,
+                    .bloom_intensity = bloom_settings_.intensity,
+            },
+            fullscreen ? ui_overlay : render_pass::Callback{});
+
+    if (!result) {
+        return std::unexpected(result.error());
+    }
+
+    if (fullscreen) {
+        return {};
+    }
+
+    render_pass::transition_to_shader_read(pass_context.command_buffer, *targets.viewport);
+
+    render_pass::ui_only(pass_context,
+                         render_pass::UiOnlyPassInfo{
+                                 .target_image = swapchain_image.image,
+                                 .target_view = swapchain_image.view,
+                                 .extent = swapchain_image.extent,
+                         },
+                         ui_overlay);
+
+    return {};
+}
+
+auto Renderer::record_frame_end(VkCommandBuffer command_buffer, SwapchainImage const &swapchain_image,
+                                std::uint32_t frame_index) -> void {
+    bool const screenshot_recorded = screenshot_->record(context_, command_buffer, swapchain_image.image,
+                                                         swapchain_image.format, swapchain_image.extent, frame_index);
+
+    if (!screenshot_recorded) {
+        render_pass::present_swapchain(command_buffer, swapchain_image.image);
+    }
+
+    auto &frame_query = timestamp_queries_[frame_index];
+
+    vkCmdWriteTimestamp2(command_buffer, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, frame_query.query_pool,
+                         (static_cast<std::uint32_t>(RenderStage::FullFrame) * 2) + 1);
+
+    frame_query.has_results = true;
+    pipeline_stat_queries_[frame_index].has_results = true;
+}
+
 template<typename OverlayPolicy>
 [[nodiscard]] auto Renderer::record_frame(VkCommandBuffer command_buffer, SwapchainImage const &swapchain_image,
                                           std::uint32_t frame_index, Application const &app, glm::mat4 const &vp)
@@ -2958,56 +3329,11 @@ template<typename OverlayPolicy>
     screenshot_->try_resolve(frame_index);
 
     auto &frame = frames_[frame_index];
-    auto &frame_query = timestamp_queries_[frame_index];
+    consume_culled_readback(frame);
 
-    // Same "safe once this frame-in-flight slot's fence has been waited on"
-    // point screenshot_.try_resolve() relies on above -- the copy recorded
-    // in prepare_frame's Culling region the last time this frame_index was
-    // used has long since completed on the GPU by now. See
-    // RendererFrame::culled_readback_buffer's comment for the resulting lag.
-    if (frame.culled_readback_pending) {
-        frame.culled_readback_pending = false;
-
-        if (auto invalidated = frame.culled_readback_buffer.invalidate(
-                    0, static_cast<VkDeviceSize>(frame.culled_readback_count) * sizeof(GpuDrawCommand));
-            !invalidated) {
-            error("[Renderer] Failed to invalidate culled-indirect readback buffer");
-        } else if (auto const *commands = frame.culled_readback_buffer.mapped_data_as<GpuDrawCommand const>();
-                   commands != nullptr) {
-            std::uint32_t visible_instance_count = 0;
-
-            for (std::uint32_t i = 0; i < frame.culled_readback_count; ++i) {
-                visible_instance_count += commands[i].instance_count;
-            }
-
-            last_frame_stats_.visible_instance_count = visible_instance_count;
-        }
-    }
-
-    auto const hdr_handle = frame.forward_target.hdr();
-    auto const depth_handle = frame.forward_target.depth();
-    auto const resolved_hdr_handle =
-            frame.forward_target.is_multisampled() ? frame.forward_target.resolved_hdr() : hdr_handle;
-    auto const resolved_depth_handle =
-            frame.forward_target.is_multisampled() ? frame.forward_target.resolved_depth() : depth_handle;
-
-    auto const *hdr = image_storage_.get(hdr_handle);
-    auto const *depth = image_storage_.get(depth_handle);
-    auto const *resolved_hdr = image_storage_.get(resolved_hdr_handle);
-    auto const *resolved_depth = image_storage_.get(resolved_depth_handle);
-    auto const *shadow_atlas = image_storage_.get(shadow_atlas_);
-
-    if (hdr == nullptr || depth == nullptr || resolved_hdr == nullptr || resolved_depth == nullptr ||
-        shadow_atlas == nullptr || !hdr->valid() || !depth->valid() || !resolved_hdr->valid() ||
-        !resolved_depth->valid() || !shadow_atlas->valid()) {
-        return std::unexpected(make_error(RendererErrorType::image_error));
-    }
-
-    auto const target_extent = frame.forward_target.extent();
-    if (target_extent.width == 0 || target_extent.height == 0 || hdr->extent_2d().width != target_extent.width ||
-        hdr->extent_2d().height != target_extent.height || depth->extent_2d().width != target_extent.width ||
-        depth->extent_2d().height != target_extent.height) {
-        return std::unexpected(make_error(RendererErrorType::invalid_argument));
+    auto const targets = resolve_frame_targets(frame);
+    if (!targets) {
+        return std::unexpected(targets.error());
     }
 
     auto const pass_context = render_pass::Context{
@@ -3015,295 +3341,45 @@ template<typename OverlayPolicy>
             .frame_index = frame_index,
             .pipeline_graph = pipeline_graph_,
             .resource_table = gpu_resource_table_,
-            .timestamp_query_pool = frame_query.query_pool,
+            .timestamp_query_pool = timestamp_queries_[frame_index].query_pool,
     };
-
-    auto const main_view_buffers = render_pass::DrawBuffers{
-            .draws = frame.visible_draw_buffer,
-            .transforms = frame.visible_transform_buffer,
-            .indirect = frame.culled_indirect_buffer,
-            .index_buffer = geometry_arena_.bindable_buffer(),
-    };
-
-    auto const main_view_counts = render_pass::DrawCounts{
-            .opaque = frame.opaque_indirect_count,
-            .mask = frame.mask_indirect_count,
-            .blend = frame.blend_indirect_count,
-    };
-
-    {
-        TracyVkZoneC(context_.host_query_context.context, command_buffer, "Shadow Pass", tracy::Color::Purple);
-
-        auto const result = render_pass::shadow(
-                pass_context, render_pass::ShadowPassInfo{
-                                      .shadow_atlas = *shadow_atlas,
-                                      .draws =
-                                              {
-                                                      .draws = frame.draw_buffer,
-                                                      .transforms = frame.transform_buffer,
-                                                      .indirect = frame.indirect_buffer,
-                                                      .index_buffer = geometry_arena_.bindable_buffer(),
-                                              },
-                                      .counts =
-                                              {
-                                                      .opaque = frame.opaque_indirect_count,
-                                                      .mask = frame.mask_indirect_count,
-                                                      .blend = frame.blend_indirect_count,
-                                              },
-                                      .opaque_cascade_counts = frame.shadow_opaque_indirect_count,
-                                      .mask_cascade_counts = frame.shadow_mask_indirect_count,
-                                      .update_mask = frame.shadow_update_mask,
-                                      .preserve_contents = shadow_atlas_initialized_,
-                                      .meshlet_culling = meshlet_culling_,
-                                      .cascade_cull_planes_address =
-                                              frame.frustum_planes_buffer.device_address + 6 * sizeof(glm::vec4),
-                                      .materials_address = material_storage_.device_address(),
-                                      .ubo_address = ubos_[frame_index].device_address,
-                                      .lights_address = frame.lights_buffer.device_address,
-                                      .opaque_pipeline = shadow_pipeline_,
-                                      .mask_pipeline = shadow_mask_pipeline_,
-                                      .opaque_instanced_pipeline = shadow_instanced_pipeline_,
-                                      .mask_instanced_pipeline = shadow_mask_instanced_pipeline_,
-                                      .depth_bias_constant = shadow_settings_.depth_bias_constant,
-                                      .depth_bias_slope = shadow_settings_.depth_bias_slope,
-                              });
-
-        if (!result) {
-            return std::unexpected(result.error());
-        }
-
-        if (frame.shadow_update_mask != 0) {
-            for (std::uint32_t cascade = 0; cascade < shadow_cascade_count; ++cascade) {
-                if ((frame.shadow_update_mask & (ShadowCascadeMask{1} << cascade)) != 0) {
-                    shadow_cascade_cache_[cascade] = frame.pending_shadow_cache[cascade];
-                }
-            }
-
-            cached_shadow_light_direction_ = frame.pending_shadow_light_direction;
-            cached_shadow_depth_bias_constant_ = frame.pending_shadow_depth_bias_constant;
-            cached_shadow_depth_bias_slope_ = frame.pending_shadow_depth_bias_slope;
-            cached_shadow_caster_revision_ = frame.pending_shadow_caster_revision;
-            shadow_scene_signature_ = frame.pending_shadow_scene_signature;
-            shadow_scene_signature_valid_ = true;
-            shadow_global_state_valid_ = true;
-            shadow_atlas_initialized_ = true;
-        }
-    }
-
-    render_pass::prepare_forward_targets(
-            pass_context, render_pass::ForwardTargets{
-                                  .hdr = *hdr,
-                                  .depth = *depth,
-                                  .resolved_hdr = frame.forward_target.is_multisampled() ? resolved_hdr : nullptr,
-                                  .resolved_depth = frame.forward_target.is_multisampled() ? resolved_depth : nullptr,
-                          });
-
-    {
-        TracyVkZoneC(context_.host_query_context.context, command_buffer, "Depth Prepass", tracy::Color::SlateGray);
-
-        auto const result = render_pass::depth_prepass(
-                pass_context,
-                render_pass::DepthPrepassInfo{
-                        .depth = *depth,
-                        .resolved_depth = frame.forward_target.is_multisampled() ? resolved_depth : nullptr,
-                        .extent = target_extent,
-                        .samples = samples_,
-                        .draws = main_view_buffers,
-                        .counts = main_view_counts,
-                        .cull_planes_address = frame.frustum_planes_buffer.device_address,
-                        .materials_address = material_storage_.device_address(),
-                        .ubo_address = ubos_[frame_index].device_address,
-                        .lights_address = frame.lights_buffer.device_address,
-                        .opaque_pipeline = depth_prepass_pipeline_,
-                        .mask_pipeline = depth_prepass_mask_pipeline_,
-                        .opaque_instanced_pipeline = depth_prepass_instanced_pipeline_,
-                        .mask_instanced_pipeline = depth_prepass_mask_instanced_pipeline_,
-                        .meshlet_culling = meshlet_culling_,
-                });
-
-        if (!result) {
-            return std::unexpected(result.error());
-        }
-    }
-
-    auto const *ao_raw = image_storage_.get(frame.ao_target.raw);
-    auto const *ao_denoised = image_storage_.get(frame.ao_target.denoised);
-
-    if (ao_raw == nullptr || ao_denoised == nullptr || !ao_raw->valid() || !ao_denoised->valid()) {
-        return std::unexpected(make_error(RendererErrorType::image_error));
-    }
-
-    auto ao_output = [&] {
-        TracyVkZoneC(context_.host_query_context.context, command_buffer, "Ambient Occlusion",
-                     tracy::Color::DarkSlateGray);
-
-        return render_pass::ambient_occlusion(pass_context,
-                                              render_pass::AmbientOcclusionInfo{
-                                                      .enabled = ao_settings_.enabled,
-                                                      .depth = *resolved_depth,
-                                                      .raw_ao = *ao_raw,
-                                                      .denoised_ao = *ao_denoised,
-                                                      .extent = target_extent,
-                                                      .depth_texture_index = resolved_depth_handle.index,
-                                                      .raw_ao_texture_index = frame.ao_target.raw.index,
-                                                      .denoised_ao_texture_index = frame.ao_target.denoised.index,
-                                                      .point_sampler_index = sampler_storage_.nearest_clamp().index,
-                                                      .ubo_address = ubos_[frame_index].device_address,
-                                                      .gtao_pipeline = gtao_pipeline_,
-                                                      .denoise_pipeline = gtao_denoise_pipeline_,
-                                                      .radius_view = ao_settings_.radius,
-                                                      .falloff_range = ao_settings_.falloff_range,
-                                                      .slice_count = ao_settings_.slice_count,
-                                                      .step_count = ao_settings_.step_count,
-                                                      .denoise_depth_sigma = ao_settings_.denoise_depth_sigma,
-                                              });
-    }();
-
-    if (!ao_output) {
-        return std::unexpected(ao_output.error());
-    }
-
-    auto const ao_texture_index = ao_output->has_value() ? (*ao_output)->index : image_storage_.white().index;
 
     auto debug_overlay = [&] { OverlayPolicy::render_debug(app, command_buffer, vp, frame_index); };
-
-    auto hdr_output = [&] {
-        TracyVkZoneC(context_.host_query_context.context, command_buffer, "Forward Pass", tracy::Color::RoyalBlue);
-
-        return render_pass::forward_geometry(
-                pass_context,
-                render_pass::ForwardGeometryInfo{
-                        .hdr = *hdr,
-                        .depth = *depth,
-                        .resolved_hdr = frame.forward_target.is_multisampled() ? resolved_hdr : nullptr,
-                        .output_hdr = {.index = resolved_hdr_handle.index},
-                        .extent = target_extent,
-                        .samples = samples_,
-                        .draws = main_view_buffers,
-                        .counts = main_view_counts,
-                        .cull_planes_address = frame.frustum_planes_buffer.device_address,
-                        .materials_address = material_storage_.device_address(),
-                        .ubo_address = ubos_[frame_index].device_address,
-                        .lights_address = frame.lights_buffer.device_address,
-                        .light_count = frame.light_count,
-                        .pipeline_statistics_query_pool = pipeline_stat_queries_[frame_index].query_pool,
-                        .meshlet_culling = meshlet_culling_,
-                        .opaque_pipeline = forward_pipeline_,
-                        .blend_pipeline = forward_blend_pipeline_,
-                        .opaque_instanced_pipeline = forward_instanced_pipeline_,
-                        .blend_instanced_pipeline = forward_blend_instanced_pipeline_,
-                        .draw_light_icons = debug_draw_light_icons_,
-                        .light_icon_pipeline = light_icon_pipeline_,
-                        .light_icon_texture_index = light_icon_texture_.index,
-                        .linear_sampler_index = sampler_storage_.linear_clamp().index,
-                        .light_icon_world_size = light_icon_world_size_,
-                        .ao_texture_index = ao_texture_index,
-                        .ao_sampler_index = sampler_storage_.linear_clamp().index,
-                },
-                render_pass::Callback::bind(debug_overlay));
-    }();
-
-    if (!hdr_output) {
-        return std::unexpected(hdr_output.error());
-    }
-
-    auto const *bloom_target = bloom_settings_.enabled ? image_storage_.get(frame.bloom_target.image) : nullptr;
-
-    auto bloom_output = [&] {
-        TracyVkZoneC(context_.host_query_context.context, command_buffer, "Bloom Pass", tracy::Color::Orange);
-
-        return render_pass::bloom(pass_context, render_pass::BloomPassInfo{
-                                                        .enabled = bloom_settings_.enabled,
-                                                        .input_hdr = *hdr_output,
-                                                        .target = bloom_target,
-                                                        .mip_texture_indices =
-                                                                {
-                                                                        frame.bloom_target.mip_slots[0].index,
-                                                                        frame.bloom_target.mip_slots[1].index,
-                                                                        frame.bloom_target.mip_slots[2].index,
-                                                                        frame.bloom_target.mip_slots[3].index,
-                                                                },
-                                                        .input_extent = target_extent,
-                                                        .downsample_pipeline = bloom_downsample_pipeline_,
-                                                        .upsample_pipeline = bloom_upsample_pipeline_,
-                                                        .linear_sampler_index = sampler_storage_.linear_clamp().index,
-                                                        .threshold = bloom_settings_.threshold,
-                                                        .knee = bloom_settings_.knee,
-                                                        .filter_radius = bloom_settings_.filter_radius,
-                                                });
-    }();
-
-    if (!bloom_output) {
-        return std::unexpected(bloom_output.error());
-    }
-
     auto ui_overlay = [&] { OverlayPolicy::render_ui(app, command_buffer, frame_index); };
 
-    // Fullscreen play covers the whole swapchain with the game exactly like
-    // this engine always has -- composite() writes the tonemapped scene
-    // straight into the swapchain image and ui_overlay draws directly on
-    // top of it, all in one pass. Any other time (editing, or playing
-    // embedded), the scene instead goes into this frame's offscreen
-    // viewport_target -- which the editor's Viewport panel samples via
-    // ImGui::Image -- and a second, separate pass clears the real swapchain
-    // and draws the full (docked) ImGui frame onto it. See the plan this
-    // shipped under for why: a docked "Viewport" panel is itself a real
-    // ImGui window, so it can't be the thing composite() paints the 3D
-    // scene onto without also being asked to host arbitrary editor chrome
-    // around it.
+    if (auto shadows = record_shadow_pass(pass_context, frame, *targets); !shadows) {
+        return shadows;
+    }
+
+    if (auto prepass = record_depth_prepass(pass_context, frame, *targets); !prepass) {
+        return prepass;
+    }
+
+    auto const ao_texture_index = record_ambient_occlusion_pass(pass_context, frame, *targets);
+    if (!ao_texture_index) {
+        return std::unexpected(ao_texture_index.error());
+    }
+
+    auto const hdr = record_forward_pass(pass_context, frame, *targets, *ao_texture_index,
+                                         render_pass::Callback::bind(debug_overlay));
+    if (!hdr) {
+        return std::unexpected(hdr.error());
+    }
+
+    auto const bloom = record_bloom_pass(pass_context, frame, *targets, *hdr);
+    if (!bloom) {
+        return std::unexpected(bloom.error());
+    }
+
     bool const fullscreen = app.is_playing && app.play_fullscreen;
 
-    {
-        TracyVkZoneC(context_.host_query_context.context, command_buffer, "Composition", tracy::Color::SeaGreen);
-
-        auto const *viewport_target_image = image_storage_.get(frame.viewport_target);
-
-        auto const result = render_pass::composite(
-                pass_context,
-                render_pass::CompositePassInfo{
-                        .swapchain_image = fullscreen ? swapchain_image.image : viewport_target_image->image(),
-                        .swapchain_view = fullscreen ? swapchain_image.view : viewport_target_image->view(),
-                        .extent = fullscreen ? swapchain_image.extent : target_extent,
-                        .hdr = *hdr_output,
-                        .bloom = *bloom_output,
-                        // The default emissive texture is the renderer's valid black texture.
-                        .bloom_fallback_texture_index = image_storage_.emissive().index,
-                        .linear_sampler_index = sampler_storage_.linear_clamp().index,
-                        .pipeline = composite_pipeline_,
-                        .exposure = 1.0F,
-                        .bloom_intensity = bloom_settings_.intensity,
-                },
-                fullscreen ? render_pass::Callback::bind(ui_overlay) : render_pass::Callback{});
-
-        if (!result) {
-            return std::unexpected(result.error());
-        }
-
-        if (!fullscreen) {
-            render_pass::transition_to_shader_read(command_buffer, *viewport_target_image);
-
-            render_pass::ui_only(pass_context,
-                                 render_pass::UiOnlyPassInfo{
-                                         .target_image = swapchain_image.image,
-                                         .target_view = swapchain_image.view,
-                                         .extent = swapchain_image.extent,
-                                 },
-                                 render_pass::Callback::bind(ui_overlay));
-        }
+    if (auto composited = record_composite_pass(pass_context, *targets, swapchain_image, *hdr, *bloom, fullscreen,
+                                                render_pass::Callback::bind(ui_overlay));
+        !composited) {
+        return composited;
     }
 
-    bool const screenshot_recorded = screenshot_->record(context_, command_buffer, swapchain_image.image,
-                                                         swapchain_image.format, swapchain_image.extent, frame_index);
-
-    if (!screenshot_recorded) {
-        render_pass::present_swapchain(command_buffer, swapchain_image.image);
-    }
-
-    vkCmdWriteTimestamp2(command_buffer, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, frame_query.query_pool,
-                         (static_cast<std::uint32_t>(RenderStage::FullFrame) * 2) + 1);
-
-    frame_query.has_results = true;
-    pipeline_stat_queries_[frame_index].has_results = true;
+    record_frame_end(command_buffer, swapchain_image, frame_index);
 
     TracyVkCollectHost(context_.host_query_context.context);
     return {};
@@ -3492,7 +3568,7 @@ auto Renderer::resize(VkExtent2D extent) -> std::expected<void, RendererError> {
                 .flags = 0,
                 .samples = VK_SAMPLE_COUNT_1_BIT,
                 .tiling = VK_IMAGE_TILING_OPTIMAL,
-                .mip_levels = 4,
+                .mip_levels = render_pass::bloom_mip_count,
                 .array_layers = 1,
                 .create_mip_layer_views = true,
                 .debug_name = bloom_target_name,
@@ -3508,7 +3584,7 @@ auto Renderer::resize(VkExtent2D extent) -> std::expected<void, RendererError> {
 
         auto const *bloom_image_ptr = image_storage_.get(*bloom_image);
 
-        for (std::uint32_t mip = 0; mip < 4; ++mip) {
+        for (std::uint32_t mip = 0; mip < render_pass::bloom_mip_count; ++mip) {
             auto const view = bloom_image_ptr->mip_layer_view(mip, 0);
 
             auto mip_slot = image_storage_.register_view(ImageViewRegistration{
